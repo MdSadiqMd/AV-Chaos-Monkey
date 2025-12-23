@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package udp_simulator.v1;
 
-option go_package = "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pb";
+option go_package = "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf";
 
 service OrchestratorService {
   rpc CreateTest(CreateTestRequest) returns (CreateTestResponse);

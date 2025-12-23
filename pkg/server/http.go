@@ -9,8 +9,8 @@ import (
 	"time"
 
 	customMiddleware "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/middleware"
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pb"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pool"
+	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/spike"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"

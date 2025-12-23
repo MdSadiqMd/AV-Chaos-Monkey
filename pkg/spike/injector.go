@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/network"
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pb"
+	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 )
 
 type SpikeType string
