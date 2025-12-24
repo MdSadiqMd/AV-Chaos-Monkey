@@ -55,6 +55,7 @@ func (s *HTTPServer) Start() error {
 			r.Get("/", s.handleGetTest)
 			r.Post("/start", s.handleStartTest)
 			r.Post("/stop", s.handleStopTest)
+			r.Get("/metrics", s.handleGetMetrics)
 			r.Post("/spike", s.handleInjectSpike)
 			r.Get("/sdp/{participantID}", s.handleGetSDP)
 			r.Post("/answer/{participantID}", s.handleSetAnswer)
@@ -223,15 +224,124 @@ func (s *HTTPServer) handleStopTest(w http.ResponseWriter, r *http.Request) {
 	session.Pool.Stop()
 	session.State = "stopped"
 	s.spikeInject.RemoveAll()
+
+	finalMetrics := session.Pool.GetMetrics()
 	resp := &pb.StopTestResponse{
-		Stopped: true,
+		Stopped:      true,
+		FinalMetrics: finalMetrics,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Injects a spike during runtime
+func (s *HTTPServer) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
+	session, err := s.getTestSession(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if session.Pool == nil {
+		http.Error(w, "Test session not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	format := r.URL.Query().Get("format")
+
+	metrics := session.Pool.GetMetrics()
+	if metrics == nil {
+		http.Error(w, "Metrics not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	if format == "prometheus" {
+		w.Header().Set("Content-Type", "text/plain")
+
+		// Generate Prometheus format using aggregate metrics
+		// Aggregate metrics have type="aggregate" to distinguish from individual participant metrics
+		output := fmt.Sprintf(`# HELP rtp_frames_sent_total Total RTP frames sent
+# TYPE rtp_frames_sent_total counter
+rtp_frames_sent_total{test_id="%s",type="aggregate"} %d
+
+# HELP rtp_packets_sent_total Total RTP packets sent
+# TYPE rtp_packets_sent_total counter
+rtp_packets_sent_total{test_id="%s",type="aggregate"} %d
+
+# HELP rtp_bytes_sent_total Total bytes sent
+# TYPE rtp_bytes_sent_total counter
+rtp_bytes_sent_total{test_id="%s",type="aggregate"} %d
+
+# HELP rtp_jitter_ms RTP jitter in milliseconds
+# TYPE rtp_jitter_ms gauge
+rtp_jitter_ms{test_id="%s",type="aggregate"} %.2f
+
+# HELP rtp_packet_loss_percent Packet loss percentage
+# TYPE rtp_packet_loss_percent gauge
+rtp_packet_loss_percent{test_id="%s",type="aggregate"} %.2f
+
+# HELP rtp_mos_score Mean Opinion Score (1-4.5)
+# TYPE rtp_mos_score gauge
+rtp_mos_score{test_id="%s",type="aggregate"} %.2f
+
+# HELP rtp_bitrate_kbps Total bitrate in kbps
+# TYPE rtp_bitrate_kbps gauge
+rtp_bitrate_kbps{test_id="%s",type="aggregate"} %d
+
+# HELP rtp_test_state Test state (0=created, 1=running, 2=stopped)
+# TYPE rtp_test_state gauge
+rtp_test_state{test_id="%s"} %d
+
+# HELP rtp_test_elapsed_seconds Test elapsed time in seconds
+# TYPE rtp_test_elapsed_seconds gauge
+rtp_test_elapsed_seconds{test_id="%s"} %d
+
+`,
+			session.ID, metrics.Aggregate.TotalFramesSent,
+			session.ID, metrics.Aggregate.TotalPacketsSent,
+			session.ID, metrics.Aggregate.TotalBitrateKbps*1000/8, // Convert kbps to bytes (approximate)
+			session.ID, metrics.Aggregate.AvgJitterMs,
+			session.ID, metrics.Aggregate.AvgPacketLoss,
+			session.ID, metrics.Aggregate.AvgMosScore,
+			session.ID, metrics.Aggregate.TotalBitrateKbps,
+			session.ID, func() int {
+				switch session.State {
+				case "running":
+					return 1
+				case "stopped":
+					return 2
+				default:
+					return 0
+				}
+			}(),
+			session.ID, metrics.ElapsedSeconds,
+		)
+
+		// Include individual participant metrics if available
+		if len(metrics.Participants) > 0 {
+			for _, p := range metrics.Participants {
+				output += fmt.Sprintf(`rtp_frames_sent_total{test_id="%s",participant_id="%d"} %d
+rtp_jitter_ms{test_id="%s",participant_id="%d"} %.2f
+rtp_packet_loss_percent{test_id="%s",participant_id="%d"} %.2f
+rtp_mos_score{test_id="%s",participant_id="%d"} %.2f
+
+`,
+					session.ID, p.ParticipantId, p.FramesSent,
+					session.ID, p.ParticipantId, p.JitterMs,
+					session.ID, p.ParticipantId, p.PacketLossPercent,
+					session.ID, p.ParticipantId, p.MosScore,
+				)
+			}
+		}
+
+		w.Write([]byte(output))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+// Injects spike during runtime
 func (s *HTTPServer) handleInjectSpike(w http.ResponseWriter, r *http.Request) {
 	session, err := s.getTestSession(r)
 	if err != nil {
