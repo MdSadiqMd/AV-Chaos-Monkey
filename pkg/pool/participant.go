@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/rtp"
 )
@@ -30,6 +31,9 @@ type VirtualParticipant struct {
 	frameCount  atomic.Int64
 	bytesSent   atomic.Int64
 	packetsSent atomic.Int64
+
+	// Metrics
+	metrics *metrics.RTPMetrics
 
 	// RTP
 	packetizer *rtp.H264Packetizer
@@ -60,14 +64,23 @@ type ParticipantPool struct {
 	// Target configuration for UDP
 	targetHost string
 	targetPort int
+
+	// Cached aggregate metrics for fast retrieval
+	cachedMetricsMu   sync.RWMutex
+	cachedMetrics     *pb.MetricsResponse
+	cachedMetricsTime time.Time
+	metricsCacheTTL   time.Duration
 }
 
 func NewParticipantPool(testID string) *ParticipantPool {
 	pp := &ParticipantPool{
-		participants: make(map[uint32]*VirtualParticipant),
-		testID:       testID,
-		targetHost:   "127.0.0.1", // Default to localhost
+		participants:    make(map[uint32]*VirtualParticipant),
+		testID:          testID,
+		targetHost:      "127.0.0.1", // Default to localhost
+		metricsCacheTTL: 500 * time.Millisecond,
 	}
+	// background metrics aggregator
+	go pp.runMetricsAggregator()
 	return pp
 }
 
@@ -115,6 +128,7 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 		SrtpMasterKey:  generateRandomBytes(32),
 		SrtpMasterSalt: generateRandomBytes(14),
 		BackendRTPPort: backendPort,
+		metrics:        metrics.NewRTPMetrics(id),
 		packetizer:     rtp.NewH264Packetizer(id, 96, 90000),
 		activeSpikes:   make(map[string]*pb.SpikeEvent),
 	}
@@ -204,6 +218,138 @@ func (pp *ParticipantPool) Stop() {
 	log.Printf("[Pool] Stopped all participants")
 }
 
+// Background worker to update cached metrics
+func (pp *ParticipantPool) runMetricsAggregator() {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if !pp.running.Load() {
+			continue
+		}
+		pp.updateCachedMetrics()
+	}
+}
+
+// Updates the cached aggregate metrics
+func (pp *ParticipantPool) updateCachedMetrics() {
+	pp.mu.RLock()
+	participantCount := len(pp.participants)
+
+	// Quick aggregate without individual participant metrics
+	var totalFrames, totalPackets, totalBitrate int64
+	var totalJitter, totalLoss, totalMos float64
+
+	// Collect participant list for metrics generation
+	participantsList := make([]*VirtualParticipant, 0, participantCount)
+	for _, p := range pp.participants {
+		participantsList = append(participantsList, p)
+		// Use atomic loads directly to avoid lock contention
+		totalFrames += p.frameCount.Load()
+		totalPackets += p.packetsSent.Load()
+		totalBitrate += int64(p.VideoConfig.BitrateKbps)
+
+		// Quick jitter/loss access - minimize lock time
+		p.activeSpikesMu.RLock()
+		spikeCount := len(p.activeSpikes)
+		p.activeSpikesMu.RUnlock()
+
+		// Simplified MOS calculation based on spike count
+		if spikeCount > 0 {
+			totalMos += 3.5 // Degraded
+			totalLoss += 5.0
+			totalJitter += 10.0
+		} else {
+			totalMos += 4.45 // Excellent
+		}
+	}
+	pp.mu.RUnlock()
+
+	count := float64(participantCount)
+	if count == 0 {
+		count = 1
+	}
+
+	elapsed := int64(0)
+	if !pp.startTime.IsZero() {
+		elapsed = int64(time.Since(pp.startTime).Seconds())
+	}
+
+	// Include individual participant metrics for Prometheus export
+	// For 50 participants, include all; for more, sample to keep reasonable
+	participantMetrics := make([]*pb.ParticipantMetrics, 0, participantCount)
+	if participantCount > 0 && len(participantsList) > 0 {
+		sampleRate := 1
+		if participantCount > 100 {
+			sampleRate = participantCount / 100 // Sample to keep ~100 participants max
+		}
+
+		for i, p := range participantsList {
+			if p == nil {
+				continue
+			}
+			if i%sampleRate == 0 {
+				// Get individual metrics (this is fast - uses atomic loads)
+				pm := p.GetMetrics()
+				if pm != nil {
+					participantMetrics = append(participantMetrics, pm)
+				}
+			}
+		}
+	}
+
+	metricsResp := &pb.MetricsResponse{
+		TestId:         pp.testID,
+		ElapsedSeconds: elapsed,
+		Participants:   participantMetrics, // Include individual metrics for Prometheus
+		Aggregate: &pb.AggregateMetrics{
+			TotalFramesSent:  totalFrames,
+			TotalPacketsSent: totalPackets,
+			AvgJitterMs:      totalJitter / count,
+			AvgPacketLoss:    totalLoss / count,
+			AvgMosScore:      totalMos / count,
+			TotalBitrateKbps: totalBitrate,
+		},
+	}
+
+	pp.cachedMetricsMu.Lock()
+	pp.cachedMetrics = metricsResp
+	pp.cachedMetricsTime = time.Now()
+	pp.cachedMetricsMu.Unlock()
+}
+
+// Returns cached metrics for fast access (used by HTTP handlers)
+func (pp *ParticipantPool) GetMetrics() *pb.MetricsResponse {
+	// Return cached metrics if available and fresh
+	pp.cachedMetricsMu.RLock()
+	cached := pp.cachedMetrics
+	cacheTime := pp.cachedMetricsTime
+	pp.cachedMetricsMu.RUnlock()
+
+	if cached != nil && time.Since(cacheTime) < pp.metricsCacheTTL {
+		// Update elapsed time in cached response
+		elapsed := int64(0)
+		if !pp.startTime.IsZero() {
+			elapsed = int64(time.Since(pp.startTime).Seconds())
+		}
+		// Return copy with updated elapsed time
+		return &pb.MetricsResponse{
+			TestId:         cached.TestId,
+			ElapsedSeconds: elapsed,
+			Participants:   cached.Participants,
+			Aggregate:      cached.Aggregate,
+		}
+	}
+
+	// If no cache, compute fresh (this should only happen during startup)
+	pp.updateCachedMetrics()
+
+	pp.cachedMetricsMu.RLock()
+	defer pp.cachedMetricsMu.RUnlock()
+	return pp.cachedMetrics
+}
+
+// Injects a spike for specific participants
 func (pp *ParticipantPool) InjectSpike(spike *pb.SpikeEvent) error {
 	pp.mu.RLock()
 	defer pp.mu.RUnlock()
@@ -262,6 +408,7 @@ func (p *VirtualParticipant) runFrameLoop() {
 
 		// Check for frame drop spike
 		if p.shouldDropFrame() {
+			p.metrics.RecordFrameDropped()
 			continue
 		}
 
@@ -279,6 +426,7 @@ func (p *VirtualParticipant) runFrameLoop() {
 		for _, pkt := range packets {
 			// Apply packet loss spike if active
 			if p.shouldDropPacket() {
+				p.metrics.RecordPacketLost()
 				continue
 			}
 
@@ -289,13 +437,17 @@ func (p *VirtualParticipant) runFrameLoop() {
 			if p.udpEnabled && p.udpConn != nil && p.targetAddr != nil {
 				n, err := p.udpConn.WriteToUDP(data, p.targetAddr)
 				if err != nil {
+					p.metrics.RecordPacketLost()
 					continue
 				}
 				p.packetsSent.Add(1)
 				p.bytesSent.Add(int64(n))
+				p.metrics.RecordPacketSent(n)
 			} else {
+				// Fallback: just update metrics without actual transmission
 				p.packetsSent.Add(1)
 				p.bytesSent.Add(int64(len(data)))
+				p.metrics.RecordPacketSent(len(data))
 			}
 		}
 	}
@@ -418,7 +570,26 @@ func (p *VirtualParticipant) RemoveSpike(spikeID string) {
 	p.activeSpikesMu.Unlock()
 }
 
-// Return the participant setup info
+func (p *VirtualParticipant) GetMetrics() *pb.ParticipantMetrics {
+	p.activeSpikesMu.RLock()
+	activeSpikeCount := int32(len(p.activeSpikes))
+	p.activeSpikesMu.RUnlock()
+
+	return &pb.ParticipantMetrics{
+		ParticipantId:      p.ID,
+		FramesSent:         p.frameCount.Load(),
+		BytesSent:          p.bytesSent.Load(),
+		PacketsSent:        p.packetsSent.Load(),
+		JitterMs:           p.metrics.GetJitter(),
+		PacketLossPercent:  p.metrics.GetPacketLoss(),
+		NackCount:          p.metrics.GetNackCount(),
+		PliCount:           p.metrics.GetPliCount(),
+		MosScore:           p.metrics.GetMOS(),
+		CurrentBitrateKbps: p.VideoConfig.BitrateKbps,
+		ActiveSpikeCount:   activeSpikeCount,
+	}
+}
+
 func (p *VirtualParticipant) GetSetup() *pb.ParticipantSetup {
 	return &pb.ParticipantSetup{
 		ParticipantId:  p.ID,
