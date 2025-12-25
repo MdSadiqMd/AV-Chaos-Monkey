@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Scrape chaos monkey tests using file-based service discovery
+  # Use this config when Prometheus is running locally (not in Docker)
+  - job_name: "chaos-monkey"
+    file_sd_configs:
+      - files:
+          - "./prometheus-targets/*.json"
+        refresh_interval: 5s
+    relabel_configs:
+      # Extract test_id from labels and rewrite metrics_path
+      - source_labels: [test_id]
+        regex: (.+)
+        replacement: "/api/v1/test/${1}/metrics"
+        target_label: __metrics_path__
+      # Add format=prometheus as URL parameter
+      - source_labels: []
+        regex: .*
+        replacement: "prometheus"
+        target_label: __param_format

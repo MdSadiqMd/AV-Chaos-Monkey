@@ -1,0 +1,1351 @@
+{
+  "dashboard": {
+    "uid": "chaos-monkey-sre",
+    "title": "Chaos Monkey - SRE Dashboard",
+    "tags": ["chaos-monkey", "rtp", "webrtc", "sre"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 3,
+    "refresh": "5s",
+    "time": {
+      "from": "now-15m",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 100,
+        "title": "",
+        "type": "row",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "collapsed": false,
+        "panels": []
+      },
+      {
+        "id": 1,
+        "title": "Test Status",
+        "type": "stat",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 1
+        },
+        "targets": [
+          {
+            "expr": "rtp_test_state{test_id=~\"$test_id\"}",
+            "legendFormat": "State",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "justifyMode": "center",
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {
+                "type": "value",
+                "options": {
+                  "0": {
+                    "text": "CREATED",
+                    "color": "blue"
+                  }
+                }
+              },
+              {
+                "type": "value",
+                "options": {
+                  "1": {
+                    "text": "RUNNING",
+                    "color": "green"
+                  }
+                }
+              },
+              {
+                "type": "value",
+                "options": {
+                  "2": {
+                    "text": "STOPPED",
+                    "color": "orange"
+                  }
+                }
+              }
+            ],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "blue"
+                },
+                {
+                  "value": 1,
+                  "color": "green"
+                },
+                {
+                  "value": 2,
+                  "color": "orange"
+                }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Active Participants",
+        "type": "stat",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 4,
+          "y": 1
+        },
+        "targets": [
+          {
+            "expr": "count(rtp_frames_sent_total{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "legendFormat": "Participants",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "center",
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                }
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Elapsed Time",
+        "type": "stat",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 8,
+          "y": 1
+        },
+        "targets": [
+          {
+            "expr": "rtp_test_elapsed_seconds{test_id=~\"$test_id\"}",
+            "legendFormat": "Elapsed",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "justifyMode": "center",
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "blue"
+                }
+              ]
+            },
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Current MOS Score",
+        "type": "gauge",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 12,
+          "y": 1
+        },
+        "targets": [
+          {
+            "expr": "avg(rtp_mos_score{test_id=~\"$test_id\", type=\"aggregate\"})",
+            "legendFormat": "MOS",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "min": 1,
+            "max": 5,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "red"
+                },
+                {
+                  "value": 2.5,
+                  "color": "orange"
+                },
+                {
+                  "value": 3.5,
+                  "color": "yellow"
+                },
+                {
+                  "value": 4.0,
+                  "color": "green"
+                }
+              ]
+            },
+            "unit": "short",
+            "decimals": 2
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Current Packet Loss",
+        "type": "gauge",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 16,
+          "y": 1
+        },
+        "targets": [
+          {
+            "expr": "avg(rtp_packet_loss_percent{test_id=~\"$test_id\", type=\"aggregate\"})",
+            "legendFormat": "Loss %",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                },
+                {
+                  "value": 1,
+                  "color": "yellow"
+                },
+                {
+                  "value": 5,
+                  "color": "orange"
+                },
+                {
+                  "value": 10,
+                  "color": "red"
+                }
+              ]
+            },
+            "unit": "percent",
+            "decimals": 2
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Current Jitter",
+        "type": "gauge",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 20,
+          "y": 1
+        },
+        "targets": [
+          {
+            "expr": "avg(rtp_jitter_ms{test_id=~\"$test_id\", type=\"aggregate\"})",
+            "legendFormat": "Jitter",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "orientation": "auto",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "min": 0,
+            "max": 200,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                },
+                {
+                  "value": 30,
+                  "color": "yellow"
+                },
+                {
+                  "value": 100,
+                  "color": "orange"
+                },
+                {
+                  "value": 150,
+                  "color": "red"
+                }
+              ]
+            },
+            "unit": "ms",
+            "decimals": 1
+          }
+        }
+      },
+      {
+        "id": 101,
+        "title": "Traffic Overview",
+        "type": "row",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 5
+        },
+        "collapsed": false
+      },
+      {
+        "id": 10,
+        "title": "Total Frames Sent",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 6
+        },
+        "targets": [
+          {
+            "expr": "rtp_frames_sent_total{test_id=~\"$test_id\", type=\"aggregate\"}",
+            "legendFormat": "Total Frames",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "single",
+            "sort": "none"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "Frames",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 20,
+              "gradientMode": "opacity",
+              "hideFrom": {
+                "legend": false,
+                "tooltip": false,
+                "viz": false
+              },
+              "lineInterpolation": "smooth",
+              "lineStyle": {
+                "fill": "solid"
+              },
+              "lineWidth": 2,
+              "pointSize": 1,
+              "scaleDistribution": {
+                "type": "linear"
+              },
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {
+                "group": "A",
+                "mode": "none"
+              },
+              "thresholdsStyle": {
+                "mode": "off"
+              }
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 11,
+        "title": "Frame Rate (fps)",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 6
+        },
+        "targets": [
+          {
+            "expr": "rate(rtp_frames_sent_total{test_id=~\"$test_id\", type=\"aggregate\"}[30s])",
+            "legendFormat": "Total Frame Rate",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "single",
+            "sort": "none"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "fixedColor": "green",
+              "mode": "fixed"
+            },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "fps",
+              "axisPlacement": "auto",
+              "drawStyle": "line",
+              "fillOpacity": 15,
+              "gradientMode": "opacity",
+              "lineInterpolation": "smooth",
+              "lineWidth": 2,
+              "pointSize": 1,
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {
+                "group": "A",
+                "mode": "none"
+              },
+              "thresholdsStyle": {
+                "mode": "off"
+              }
+            },
+            "unit": "fps"
+          }
+        }
+      },
+      {
+        "id": 102,
+        "title": "Quality Metrics",
+        "type": "row",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 14
+        },
+        "collapsed": false
+      },
+      {
+        "id": 20,
+        "title": "Packet Loss Over Time",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 15
+        },
+        "targets": [
+          {
+            "expr": "rtp_packet_loss_percent{test_id=~\"$test_id\", type=\"aggregate\"}",
+            "legendFormat": "Avg Packet Loss",
+            "refId": "A"
+          },
+          {
+            "expr": "max(rtp_packet_loss_percent{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "legendFormat": "Max Participant Loss",
+            "refId": "B"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "Loss %",
+              "axisPlacement": "auto",
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "lineInterpolation": "smooth",
+              "lineWidth": 2,
+              "pointSize": 1,
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {
+                "group": "A",
+                "mode": "none"
+              },
+              "thresholdsStyle": {
+                "mode": "line+area"
+              }
+            },
+            "min": 0,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "transparent"
+                },
+                {
+                  "value": 5,
+                  "color": "red"
+                }
+              ]
+            },
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 21,
+        "title": "Jitter Over Time",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 15
+        },
+        "targets": [
+          {
+            "expr": "rtp_jitter_ms{test_id=~\"$test_id\", type=\"aggregate\"}",
+            "legendFormat": "Avg Jitter",
+            "refId": "A"
+          },
+          {
+            "expr": "max(rtp_jitter_ms{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "legendFormat": "Max Participant Jitter",
+            "refId": "B"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "Jitter (ms)",
+              "axisPlacement": "auto",
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "lineInterpolation": "smooth",
+              "lineWidth": 2,
+              "pointSize": 1,
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {
+                "group": "A",
+                "mode": "none"
+              },
+              "thresholdsStyle": {
+                "mode": "line+area"
+              }
+            },
+            "min": 0,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "transparent"
+                },
+                {
+                  "value": 100,
+                  "color": "red"
+                }
+              ]
+            },
+            "unit": "ms"
+          }
+        }
+      },
+      {
+        "id": 22,
+        "title": "MOS Score Over Time",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 23
+        },
+        "targets": [
+          {
+            "expr": "rtp_mos_score{test_id=~\"$test_id\", type=\"aggregate\"}",
+            "legendFormat": "Avg MOS",
+            "refId": "A"
+          },
+          {
+            "expr": "min(rtp_mos_score{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "legendFormat": "Min Participant MOS",
+            "refId": "B"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "palette-classic"
+            },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "MOS Score",
+              "axisPlacement": "auto",
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "lineInterpolation": "smooth",
+              "lineWidth": 2,
+              "pointSize": 1,
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {
+                "group": "A",
+                "mode": "none"
+              },
+              "thresholdsStyle": {
+                "mode": "line+area"
+              }
+            },
+            "min": 1,
+            "max": 5,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "red"
+                },
+                {
+                  "value": 3.5,
+                  "color": "transparent"
+                }
+              ]
+            },
+            "unit": "short",
+            "decimals": 2
+          }
+        }
+      },
+      {
+        "id": 23,
+        "title": "Bitrate",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 23
+        },
+        "targets": [
+          {
+            "expr": "rtp_bitrate_kbps{test_id=~\"$test_id\", type=\"aggregate\"}",
+            "legendFormat": "Total Bitrate",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "single",
+            "sort": "none"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "fixedColor": "purple",
+              "mode": "fixed"
+            },
+            "custom": {
+              "axisCenteredZero": false,
+              "axisColorMode": "text",
+              "axisLabel": "Bitrate",
+              "axisPlacement": "auto",
+              "drawStyle": "line",
+              "fillOpacity": 15,
+              "gradientMode": "opacity",
+              "lineInterpolation": "smooth",
+              "lineWidth": 2,
+              "pointSize": 1,
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {
+                "group": "A",
+                "mode": "none"
+              },
+              "thresholdsStyle": {
+                "mode": "off"
+              }
+            },
+            "unit": "kbps"
+          }
+        }
+      },
+      {
+        "id": 103,
+        "title": "Participant Distribution",
+        "type": "row",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 31
+        },
+        "collapsed": false
+      },
+      {
+        "id": 30,
+        "title": "Packet Loss Distribution",
+        "description": "Distribution of packet loss across all participants",
+        "type": "histogram",
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 32
+        },
+        "targets": [
+          {
+            "expr": "rtp_packet_loss_percent{test_id=~\"$test_id\", participant_id!=\"\"}",
+            "legendFormat": "{{participant_id}}",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "bucketCount": 20,
+          "legend": {
+            "displayMode": "hidden",
+            "placement": "bottom",
+            "showLegend": false
+          },
+          "tooltip": {
+            "mode": "single",
+            "sort": "none"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                },
+                {
+                  "value": 2,
+                  "color": "yellow"
+                },
+                {
+                  "value": 5,
+                  "color": "red"
+                }
+              ]
+            },
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 31,
+        "title": "Jitter Distribution",
+        "description": "Distribution of jitter across all participants",
+        "type": "histogram",
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 32
+        },
+        "targets": [
+          {
+            "expr": "rtp_jitter_ms{test_id=~\"$test_id\", participant_id!=\"\"}",
+            "legendFormat": "{{participant_id}}",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "bucketCount": 20,
+          "legend": {
+            "displayMode": "hidden",
+            "placement": "bottom",
+            "showLegend": false
+          },
+          "tooltip": {
+            "mode": "single",
+            "sort": "none"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                },
+                {
+                  "value": 30,
+                  "color": "yellow"
+                },
+                {
+                  "value": 100,
+                  "color": "red"
+                }
+              ]
+            },
+            "unit": "ms"
+          }
+        }
+      },
+      {
+        "id": 32,
+        "title": "MOS Distribution",
+        "description": "Distribution of MOS scores across all participants",
+        "type": "histogram",
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 32
+        },
+        "targets": [
+          {
+            "expr": "rtp_mos_score{test_id=~\"$test_id\", participant_id!=\"\"}",
+            "legendFormat": "{{participant_id}}",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "bucketCount": 20,
+          "legend": {
+            "displayMode": "hidden",
+            "placement": "bottom",
+            "showLegend": false
+          },
+          "tooltip": {
+            "mode": "single",
+            "sort": "none"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "red"
+                },
+                {
+                  "value": 3,
+                  "color": "yellow"
+                },
+                {
+                  "value": 4,
+                  "color": "green"
+                }
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 104,
+        "title": "Worst Performers",
+        "type": "row",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 40
+        },
+        "collapsed": false
+      },
+      {
+        "id": 40,
+        "title": "Top 10 Worst Packet Loss",
+        "type": "table",
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 41
+        },
+        "targets": [
+          {
+            "expr": "topk(10, rtp_packet_loss_percent{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "format": "table",
+            "instant": true,
+            "legendFormat": "",
+            "refId": "A"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true,
+                "test_id": true,
+                "__name__": true,
+                "job": true,
+                "instance": true
+              },
+              "renameByName": {
+                "participant_id": "Participant",
+                "Value": "Packet Loss %"
+              }
+            }
+          },
+          {
+            "id": "sortBy",
+            "options": {
+              "fields": {},
+              "sort": [
+                {
+                  "field": "Packet Loss %",
+                  "desc": true
+                }
+              ]
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "footer": {
+            "show": false
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "left",
+              "displayMode": "auto"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                },
+                {
+                  "value": 2,
+                  "color": "yellow"
+                },
+                {
+                  "value": 5,
+                  "color": "red"
+                }
+              ]
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Packet Loss %"
+              },
+              "properties": [
+                {
+                  "id": "unit",
+                  "value": "percent"
+                },
+                {
+                  "id": "decimals",
+                  "value": 2
+                },
+                {
+                  "id": "custom.displayMode",
+                  "value": "color-background"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 41,
+        "title": "Top 10 Worst Jitter",
+        "type": "table",
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 41
+        },
+        "targets": [
+          {
+            "expr": "topk(10, rtp_jitter_ms{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "format": "table",
+            "instant": true,
+            "legendFormat": "",
+            "refId": "A"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true,
+                "test_id": true,
+                "__name__": true,
+                "job": true,
+                "instance": true
+              },
+              "renameByName": {
+                "participant_id": "Participant",
+                "Value": "Jitter (ms)"
+              }
+            }
+          },
+          {
+            "id": "sortBy",
+            "options": {
+              "fields": {},
+              "sort": [
+                {
+                  "field": "Jitter (ms)",
+                  "desc": true
+                }
+              ]
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "footer": {
+            "show": false
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "left",
+              "displayMode": "auto"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "green"
+                },
+                {
+                  "value": 30,
+                  "color": "yellow"
+                },
+                {
+                  "value": 100,
+                  "color": "red"
+                }
+              ]
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Jitter (ms)"
+              },
+              "properties": [
+                {
+                  "id": "unit",
+                  "value": "ms"
+                },
+                {
+                  "id": "decimals",
+                  "value": 1
+                },
+                {
+                  "id": "custom.displayMode",
+                  "value": "color-background"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 42,
+        "title": "Top 10 Worst MOS",
+        "type": "table",
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 41
+        },
+        "targets": [
+          {
+            "expr": "bottomk(10, rtp_mos_score{test_id=~\"$test_id\", participant_id!=\"\"})",
+            "format": "table",
+            "instant": true,
+            "legendFormat": "",
+            "refId": "A"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true,
+                "test_id": true,
+                "__name__": true,
+                "job": true,
+                "instance": true
+              },
+              "renameByName": {
+                "participant_id": "Participant",
+                "Value": "MOS Score"
+              }
+            }
+          },
+          {
+            "id": "sortBy",
+            "options": {
+              "fields": {},
+              "sort": [
+                {
+                  "field": "MOS Score",
+                  "desc": false
+                }
+              ]
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "footer": {
+            "show": false
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "left",
+              "displayMode": "auto"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "value": null,
+                  "color": "red"
+                },
+                {
+                  "value": 3,
+                  "color": "yellow"
+                },
+                {
+                  "value": 4,
+                  "color": "green"
+                }
+              ]
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "MOS Score"
+              },
+              "properties": [
+                {
+                  "id": "decimals",
+                  "value": 2
+                },
+                {
+                  "id": "custom.displayMode",
+                  "value": "color-background"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "test_id",
+          "type": "textbox",
+          "label": "Test ID",
+          "description": "Enter test ID or use wildcard like chaos_test_*",
+          "current": {
+            "selected": true,
+            "text": "chaos_test_.*",
+            "value": "chaos_test_.*"
+          },
+          "options": [
+            {
+              "selected": true,
+              "text": "chaos_test_.*",
+              "value": "chaos_test_.*"
+            }
+          ]
+        }
+      ]
+    },
+    "annotations": {
+      "list": []
+    }
+  }
+}
