@@ -434,13 +434,18 @@ display_metrics_summary() {
         return
     fi
 
-    local state=$(echo "$metrics_json" | jq -r '.state // "unknown"')
+    local state="running"
+    local test_info=$(curl -sf "${BASE_URL}/api/v1/test/${TEST_ID}" 2>/dev/null)
+    if [ -n "$test_info" ]; then
+        state=$(echo "$test_info" | jq -r '.state // "running"')
+    fi
+    
     local elapsed=$(echo "$metrics_json" | jq -r '.elapsed_seconds // 0')
     local total_frames=$(echo "$metrics_json" | jq -r '.aggregate.total_frames_sent // 0')
     local total_packets=$(echo "$metrics_json" | jq -r '.aggregate.total_packets_sent // 0')
-    local avg_jitter=$(echo "$metrics_json" | jq -r '.aggregate.avg_jitter_ms // 0')
-    local avg_loss=$(echo "$metrics_json" | jq -r '.aggregate.avg_packet_loss // 0')
-    local avg_mos=$(echo "$metrics_json" | jq -r '.aggregate.avg_mos_score // 0')
+    local avg_jitter=$(echo "$metrics_json" | jq -r '(.aggregate.avg_jitter_ms // 0) * 100 | floor / 100')
+    local avg_loss=$(echo "$metrics_json" | jq -r '(.aggregate.avg_packet_loss // 0) * 100 | floor / 100')
+    local avg_mos=$(echo "$metrics_json" | jq -r '(.aggregate.avg_mos_score // 0) * 100 | floor / 100')
     local total_bitrate=$(echo "$metrics_json" | jq -r '.aggregate.total_bitrate_kbps // 0')
     local participant_count=$(echo "$metrics_json" | jq -r '(.participants // []) | length')
     if [ "$participant_count" = "0" ]; then
@@ -455,11 +460,17 @@ display_metrics_summary() {
 
     local participants=$(echo "$metrics_json" | jq -r '.participants // empty')
     if [ -n "$participants" ] && [ "$participants" != "null" ]; then
-        local problem_participants=$(echo "$metrics_json" | jq -r '.participants[]? | select(.packet_loss_percent > 5 or .jitter_ms > 50) | "P\(.participant_id): loss=\(.packet_loss_percent)% jitter=\(.jitter_ms)ms"' 2>/dev/null)
-        if [ -n "$problem_participants" ]; then
-            echo "$problem_participants" | while read -r line; do
-                log_warning "$line"
-            done
+        local problem_count=$(echo "$metrics_json" | jq -r '[.participants[]? | select((.packet_loss_percent // 0) > 5 or (.jitter_ms // 0) > 50)] | length' 2>/dev/null)
+        if [ -n "$problem_count" ] && [ "$problem_count" -gt 0 ] 2>/dev/null; then
+            local top_problems=$(echo "$metrics_json" | jq -r '[.participants[]? | select((.packet_loss_percent // 0) > 5 or (.jitter_ms // 0) > 50)] | sort_by(-.packet_loss_percent) | .[0:5][] | "P\(.participant_id): loss=\((.packet_loss_percent // 0) * 100 | floor / 100)% jitter=\((.jitter_ms // 0) | floor)ms"' 2>/dev/null)
+            if [ -n "$top_problems" ]; then
+                echo "$top_problems" | while read -r line; do
+                    log_warning "$line"
+                done
+                if [ "$problem_count" -gt 5 ]; then
+                    log_warning "... and $((problem_count - 5)) more participants with issues"
+                fi
+            fi
         fi
     fi
 }

@@ -77,9 +77,9 @@ show_config() {
     fi
 
     log_config "Configuration:"
-    echo "  Participants: ${BOLD}${NUM_PARTICIPANTS}${NC}"
-    echo "  Duration: ${BOLD}${TEST_DURATION_SECONDS}s${NC}"
-    echo "  Skip Test: ${BOLD}${SKIP_TEST}${NC}"
+    echo -e "  Participants: ${BOLD}${NUM_PARTICIPANTS}${NC}"
+    echo -e "  Duration: ${BOLD}${TEST_DURATION_SECONDS}s${NC}"
+    echo -e "  Skip Test: ${BOLD}${SKIP_TEST}${NC}"
     echo ""
 }
 
@@ -106,7 +106,8 @@ if [ -S "$HOME/.docker/run/docker.sock" ] || [ -S "/var/run/docker.sock" ]; then
 fi
 
 if [ "$docker_ready" = false ]; then
-    log_warning "Docker daemon is not running. Starting Docker Desktop..."r "Failed to start Docker Desktop. Please start it manually."
+    log_warning "Docker daemon is not running. Starting Docker Desktop..."
+    open -a Docker 2>/dev/null || log_error "Failed to start Docker Desktop. Please start it manually."
 
     log_info "Waiting for Docker to fully start (this may take 30-60 seconds)..."
     max_wait=90
@@ -260,3 +261,24 @@ echo "  Grafana:      http://localhost:3000 (admin/admin)"
 echo ""
 
 export_config
+
+if [ "$SKIP_TEST" = true ]; then
+    echo ""
+    echo -e "${BOLD}${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║     ALL SERVICES READY - TEST SKIPPED                          ║${NC}"
+    echo -e "${BOLD}${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    log_info "To run the test manually:"
+    echo "  cd $SCRIPT_DIR"
+    echo "  NUM_PARTICIPANTS=${NUM_PARTICIPANTS} TEST_DURATION_SECONDS=${TEST_DURATION_SECONDS} ./chaos_test.sh"
+    echo ""
+else
+    log_info "Step 7: Starting chaos test with ${NUM_PARTICIPANTS} participants..."
+    echo ""
+    echo -e "${BOLD}${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║     ALL SERVICES READY - STARTING CHAOS TEST                   ║${NC}"
+    echo -e "${BOLD}${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    cd "$SCRIPT_DIR"
+    exec ./chaos_test.sh
+fi
