@@ -425,7 +425,6 @@ display_metrics_summary() {
     local metrics_json=$1
 
     if [ -z "$metrics_json" ] || [ "$metrics_json" == "null" ]; then
-        log_warning "No metrics available"
         return
     fi
 
@@ -434,12 +433,16 @@ display_metrics_summary() {
         return
     fi
 
+    if ! echo "$metrics_json" | jq -e . >/dev/null 2>&1; then
+        return
+    fi
+
     local state="running"
     local test_info=$(curl -sf "${BASE_URL}/api/v1/test/${TEST_ID}" 2>/dev/null)
-    if [ -n "$test_info" ]; then
+    if [ -n "$test_info" ] && echo "$test_info" | jq -e . >/dev/null 2>&1; then
         state=$(echo "$test_info" | jq -r '.state // "running"')
     fi
-    
+
     local elapsed=$(echo "$metrics_json" | jq -r '.elapsed_seconds // 0')
     local total_frames=$(echo "$metrics_json" | jq -r '.aggregate.total_frames_sent // 0')
     local total_packets=$(echo "$metrics_json" | jq -r '.aggregate.total_packets_sent // 0')
@@ -746,9 +749,11 @@ main() {
 
     unregister_prometheus_target "$TEST_ID"
     if [ -n "$final_response" ] && command_exists jq; then
-        local final_metrics=$(echo "$final_response" | jq -r '.final_metrics // empty')
-        if [ -n "$final_metrics" ]; then
-            display_metrics_summary "$final_metrics"
+        if echo "$final_response" | jq -e . >/dev/null 2>&1; then
+            local final_metrics=$(echo "$final_response" | jq -r '.final_metrics // empty')
+            if [ -n "$final_metrics" ] && [ "$final_metrics" != "null" ]; then
+                display_metrics_summary "$final_metrics"
+            fi
         fi
     fi
 
