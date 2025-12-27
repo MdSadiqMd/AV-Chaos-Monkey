@@ -65,8 +65,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./config/grafana/dashboards:/etc/grafana/dashboards:ro
+      - ./config/grafana-dashboard.json:/etc/grafana/provisioning/dashboards/chaos-monkey-dashboard.json:ro
     networks:
       - simulator
     depends_on:

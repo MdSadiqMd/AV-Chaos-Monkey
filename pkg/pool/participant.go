@@ -252,15 +252,32 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 		// Quick jitter/loss access - minimize lock time
 		p.activeSpikesMu.RLock()
 		spikeCount := len(p.activeSpikes)
+		hasJitterSpike := false
+		jitterValue := 0.0
+		for _, spike := range p.activeSpikes {
+			if spike.Type == "network_jitter" {
+				hasJitterSpike = true
+				if jitterStr, ok := spike.Params["jitter_std_dev_ms"]; ok {
+					var jitterMs int
+					fmt.Sscanf(jitterStr, "%d", &jitterMs)
+					jitterValue += float64(jitterMs) / 2.0
+				}
+			}
+		}
 		p.activeSpikesMu.RUnlock()
 
 		// Simplified MOS calculation based on spike count
 		if spikeCount > 0 {
 			totalMos += 3.5 // Degraded
 			totalLoss += 5.0
-			totalJitter += 10.0
+			if hasJitterSpike {
+				totalJitter += jitterValue
+			} else {
+				totalJitter += 10.0
+			}
 		} else {
-			totalMos += 4.45 // Excellent
+			totalMos += 4.45   // Excellent
+			totalJitter += 1.0 // Minimal baseline jitter
 		}
 	}
 	pp.mu.RUnlock()
@@ -573,6 +590,20 @@ func (p *VirtualParticipant) RemoveSpike(spikeID string) {
 func (p *VirtualParticipant) GetMetrics() *pb.ParticipantMetrics {
 	p.activeSpikesMu.RLock()
 	activeSpikeCount := int32(len(p.activeSpikes))
+
+	// Calculate simulated jitter based on active jitter spikes
+	simulatedJitter := p.metrics.GetJitter() // Base jitter from actual measurements
+	for _, spike := range p.activeSpikes {
+		if spike.Type == "network_jitter" {
+			// Extract jitter parameters from spike
+			if jitterStr, ok := spike.Params["jitter_std_dev_ms"]; ok {
+				var jitterMs int
+				fmt.Sscanf(jitterStr, "%d", &jitterMs)
+				// Add simulated jitter variance (use half of std dev as average effect)
+				simulatedJitter += float64(jitterMs) / 2.0
+			}
+		}
+	}
 	p.activeSpikesMu.RUnlock()
 
 	return &pb.ParticipantMetrics{
@@ -580,7 +611,7 @@ func (p *VirtualParticipant) GetMetrics() *pb.ParticipantMetrics {
 		FramesSent:         p.frameCount.Load(),
 		BytesSent:          p.bytesSent.Load(),
 		PacketsSent:        p.packetsSent.Load(),
-		JitterMs:           p.metrics.GetJitter(),
+		JitterMs:           simulatedJitter,
 		PacketLossPercent:  p.metrics.GetPacketLoss(),
 		NackCount:          p.metrics.GetNackCount(),
 		PliCount:           p.metrics.GetPliCount(),
