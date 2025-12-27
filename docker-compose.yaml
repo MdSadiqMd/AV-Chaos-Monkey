@@ -1,0 +1,82 @@
+version: "3.8"
+
+services:
+  # Orchestrator - Main control plane
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chaos-monkey-orchestrator
+    ports:
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=info
+      # Memory limit can be overridden: GOMEMLIMIT=XGiB
+      # Default is set in Dockerfile for container memory limit
+    networks:
+      - simulator
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 30s
+    # Resource limits - these work within Docker Desktop's memory allocation
+    # For more participants, increase Docker Desktop memory allocation:
+    #   Docker Desktop → Settings → Resources → Memory
+    #
+    # Memory Guidelines (Docker Desktop Memory → Max Participants):
+    #   8 GB  → ~100 participants
+    #   16 GB → ~250 participants
+    #   24 GB → ~400 participants
+    #   32 GB → ~500 participants
+    #   40 GB → ~700 participants
+    deploy:
+      resources:
+        limits:
+          cpus: "14.0"
+          memory: 6G # Fits within default Docker Desktop (8GB), increase as needed
+        reservations:
+          cpus: "4.0"
+          memory: 2G
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: chaos-monkey-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus-targets:/etc/prometheus/targets:ro
+    networks:
+      - simulator
+    depends_on:
+      - orchestrator
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: chaos-monkey-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/etc/grafana/dashboards:ro
+    networks:
+      - simulator
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+networks:
+  simulator:
+    driver: bridge
+
+volumes:
+  grafana-data:
