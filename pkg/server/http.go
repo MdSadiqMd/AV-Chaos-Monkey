@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -17,9 +18,11 @@ import (
 )
 
 type HTTPServer struct {
-	addr        string
-	tests       map[string]*TestSession
-	spikeInject *spike.Injector
+	addr            string
+	tests           map[string]*TestSession
+	spikeInject     *spike.Injector
+	partitionID     int // Which partition this instance handles (0-indexed)
+	totalPartitions int // Total number of partitions (pods)
 }
 
 // Active test session
@@ -32,12 +35,49 @@ type TestSession struct {
 	ScheduledSpikes []*pb.SpikeEvent
 }
 
-func NewHTTPServer(addr string) *HTTPServer {
-	return &HTTPServer{
-		addr:        addr,
-		tests:       make(map[string]*TestSession),
-		spikeInject: spike.NewInjector(),
+func (ts *TestSession) StateValue() int {
+	switch ts.State {
+	case "created":
+		return 0
+	case "running":
+		return 1
+	case "stopped":
+		return 2
+	default:
+		return -1
 	}
+}
+
+func NewHTTPServer(addr string) *HTTPServer {
+	partitionID := getEnvInt("PARTITION_ID", 0)
+	totalPartitions := getEnvInt("TOTAL_PARTITIONS", 1)
+
+	log.Printf("[HTTP] Partition config: ID=%d, Total=%d", partitionID, totalPartitions)
+
+	return &HTTPServer{
+		addr:            addr,
+		tests:           make(map[string]*TestSession),
+		spikeInject:     spike.NewInjector(),
+		partitionID:     partitionID,
+		totalPartitions: totalPartitions,
+	}
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return defaultValue
+}
+
+// isMyParticipant returns true if this participant belongs to this partition
+func (s *HTTPServer) isMyParticipant(participantID uint32) bool {
+	if s.totalPartitions <= 1 {
+		return true // Single partition mode, handle all
+	}
+	return int(participantID)%s.totalPartitions == s.partitionID
 }
 
 func (s *HTTPServer) Start() error {
@@ -49,6 +89,7 @@ func (s *HTTPServer) Start() error {
 	r.Use(customMiddleware.CorsMiddleware)
 
 	r.Get("/healthz", s.handleHealth)
+	r.Get("/metrics", s.handleGetAllMetrics)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/test/create", s.handleCreateTest)
 		r.Route("/test/{testID}", func(r chi.Router) {
@@ -68,7 +109,11 @@ func (s *HTTPServer) Start() error {
 
 func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":           "healthy",
+		"partition_id":     s.partitionID,
+		"total_partitions": s.totalPartitions,
+	})
 }
 
 func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
@@ -116,10 +161,23 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(req.BackendRtpBasePort, "%d", &basePort)
 	}
 
+	// Partition-aware port allocation: each partition gets its own port range
+	// This prevents port conflicts when running multiple pods
+	portsPerPartition := 10000
+	partitionBasePort := basePort + (s.partitionID * portsPerPartition)
+
 	participants := make([]*pb.ParticipantSetup, 0, req.NumParticipants)
+	myParticipantCount := 0
 	for i := int32(0); i < req.NumParticipants; i++ {
 		id := uint32(1001 + i)
-		port := basePort + int(i)
+
+		// Only create participants assigned to this partition
+		if !s.isMyParticipant(id) {
+			continue
+		}
+
+		port := partitionBasePort + myParticipantCount
+		myParticipantCount++
 
 		p, err := participantPool.AddParticipant(id, req.Video, req.Audio, port)
 		if err != nil {
@@ -129,6 +187,9 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 
 		participants = append(participants, p.GetSetup())
 	}
+
+	log.Printf("[HTTP] Partition %d/%d: Created %d participants (of %d total requested)",
+		s.partitionID, s.totalPartitions, myParticipantCount, req.NumParticipants)
 
 	session := &TestSession{
 		ID:              req.TestId,
@@ -143,8 +204,8 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 	resp := &pb.CreateTestResponse{
 		TestId:           req.TestId,
 		Participants:     participants,
-		BackendPortStart: int32(basePort),
-		BackendPortEnd:   int32(basePort + int(req.NumParticipants) - 1),
+		BackendPortStart: int32(partitionBasePort),
+		BackendPortEnd:   int32(partitionBasePort + myParticipantCount - 1),
 		SfuGrpcEndpoint:  "localhost:50051",
 	}
 
@@ -233,6 +294,66 @@ func (s *HTTPServer) handleStopTest(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *HTTPServer) handleGetAllMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	if len(s.tests) == 0 {
+		fmt.Fprintf(w, "# No active tests\n")
+		return
+	}
+
+	// Write metric metadata once at the top
+	fmt.Fprintf(w, `# HELP rtp_frames_sent_total Total RTP frames sent
+# TYPE rtp_frames_sent_total counter
+# HELP rtp_packets_sent_total Total RTP packets sent
+# TYPE rtp_packets_sent_total counter
+# HELP rtp_jitter_ms RTP jitter in milliseconds
+# TYPE rtp_jitter_ms gauge
+# HELP rtp_packet_loss_percent Packet loss percentage
+# TYPE rtp_packet_loss_percent gauge
+# HELP rtp_mos_score Mean Opinion Score (1-4.5)
+# TYPE rtp_mos_score gauge
+# HELP rtp_bitrate_kbps Total bitrate in kbps
+# TYPE rtp_bitrate_kbps gauge
+# HELP rtp_test_state Test state (0=created, 1=running, 2=stopped)
+# TYPE rtp_test_state gauge
+# HELP rtp_active_participants Number of active participants
+# TYPE rtp_active_participants gauge
+`)
+
+	for testID, session := range s.tests {
+		if session.Pool == nil {
+			continue
+		}
+
+		metrics := session.Pool.GetMetrics()
+		if metrics == nil {
+			continue
+		}
+
+		// Output metrics in Prometheus format with partition label
+		if metrics.Aggregate != nil {
+			fmt.Fprintf(w, `rtp_frames_sent_total{test_id="%s",partition="%d"} %d
+rtp_packets_sent_total{test_id="%s",partition="%d"} %d
+rtp_jitter_ms{test_id="%s",partition="%d"} %.2f
+rtp_packet_loss_percent{test_id="%s",partition="%d"} %.2f
+rtp_mos_score{test_id="%s",partition="%d"} %.2f
+rtp_bitrate_kbps{test_id="%s",partition="%d"} %d
+rtp_test_state{test_id="%s",partition="%d"} %d
+rtp_active_participants{test_id="%s",partition="%d"} %d
+`,
+				testID, s.partitionID, metrics.Aggregate.TotalFramesSent,
+				testID, s.partitionID, metrics.Aggregate.TotalPacketsSent,
+				testID, s.partitionID, metrics.Aggregate.AvgJitterMs,
+				testID, s.partitionID, metrics.Aggregate.AvgPacketLoss,
+				testID, s.partitionID, metrics.Aggregate.AvgMosScore,
+				testID, s.partitionID, metrics.Aggregate.TotalBitrateKbps,
+				testID, s.partitionID, session.StateValue(),
+				testID, s.partitionID, len(metrics.Participants),
+			)
+		}
+	}
 }
 
 func (s *HTTPServer) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
