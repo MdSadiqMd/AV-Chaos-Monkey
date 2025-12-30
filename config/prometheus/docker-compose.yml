@@ -3,12 +3,10 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  # Scrape chaos monkey tests using file-based service discovery
-  # Use this config when Prometheus is running locally (not in Docker)
   - job_name: "chaos-monkey"
     file_sd_configs:
       - files:
-          - "./prometheus-targets/*.json"
+          - "/etc/prometheus/targets/*.json"
         refresh_interval: 5s
     relabel_configs:
       # Extract test_id from labels and rewrite metrics_path
