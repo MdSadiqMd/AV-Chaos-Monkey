@@ -47,8 +47,8 @@ services:
     ports:
       - "9091:9090"
     volumes:
-      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./config/prometheus-targets:/etc/prometheus/targets:ro
+      - ./config/prometheus/docker-compose.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/targets:/etc/prometheus/targets:ro
     networks:
       - simulator
     depends_on:
@@ -65,7 +65,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./config/grafana-dashboard.json:/etc/grafana/provisioning/dashboards/chaos-monkey-dashboard.json:ro
+      - ./config/grafana/dashboard.json:/etc/grafana/provisioning/dashboards/chaos-monkey-dashboard.json:ro
     networks:
       - simulator
     depends_on:
