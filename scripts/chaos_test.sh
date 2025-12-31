@@ -132,11 +132,40 @@ check_api_health() {
     local max_retries=5
     local retry_count=0
 
+    # Ensure kubectl port-forward is running for Kubernetes mode
+    if command -v kubectl &> /dev/null && timeout 3 kubectl get pods -l app=orchestrator --no-headers 2>/dev/null | grep -q "Running"; then
+        local pf_pid=$(pgrep -f "kubectl port-forward.*8080" | head -1)
+        if [ -z "$pf_pid" ]; then
+            log_info "Starting kubectl port-forward for orchestrator..."
+            nohup kubectl port-forward svc/orchestrator 8080:8080 > /dev/null 2>&1 &
+            sleep 2
+        else
+            # Check if process is suspended (state T)
+            local pf_state=$(ps -o state= -p "$pf_pid" 2>/dev/null | tr -d ' ')
+            if [ "$pf_state" = "T" ]; then
+                log_info "Port-forward is suspended, restarting..."
+                kill -9 "$pf_pid" 2>/dev/null
+                nohup kubectl port-forward svc/orchestrator 8080:8080 > /dev/null 2>&1 &
+                sleep 2
+            fi
+        fi
+    fi
+
     while [ $retry_count -lt $max_retries ]; do
-        if curl -sf "${BASE_URL}/healthz" >/dev/null 2>&1; then
+        if curl -sf --max-time 3 "${BASE_URL}/healthz" >/dev/null 2>&1; then
             return 0
         fi
         retry_count=$((retry_count + 1))
+        # Try restarting port-forward on first failure
+        if [ $retry_count -eq 1 ] && command -v kubectl &> /dev/null; then
+            local pf_pid=$(pgrep -f "kubectl port-forward.*8080" | head -1)
+            if [ -n "$pf_pid" ]; then
+                log_info "Port-forward may be stuck, restarting..."
+                kill -9 "$pf_pid" 2>/dev/null
+                nohup kubectl port-forward svc/orchestrator 8080:8080 > /dev/null 2>&1 &
+                sleep 2
+            fi
+        fi
         sleep 1
     done
     return 1
@@ -179,63 +208,235 @@ api_create_test() {
     local num_participants=$1
     local duration=$2
 
-    log_info "Creating test with ${num_participants} participants..."
+    # Check if running in Kubernetes with multiple pods
+    local k8s_pods=$(kubectl get pods -l app=orchestrator --no-headers 2>/dev/null | grep -c "Running" || echo 0)
 
-    local response=$(curl -sf -X POST "${BASE_URL}/api/v1/test/create" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"test_id\": \"${TEST_ID}\",
-            \"num_participants\": ${num_participants},
-            \"video\": {
-                \"width\": 1280,
-                \"height\": 720,
-                \"fps\": 30,
-                \"bitrate_kbps\": 2500,
-                \"codec\": \"h264\"
-            },
-            \"audio\": {
-                \"sample_rate\": 48000,
-                \"channels\": 1,
-                \"bitrate_kbps\": 128,
-                \"codec\": \"opus\"
-            },
-            \"duration_seconds\": ${duration},
-            \"backend_rtp_base_port\": \"5000\"
-        }")
+    if [ "$k8s_pods" -gt 1 ]; then
+        log_info "Creating test with ${num_participants} participants across ${k8s_pods} Kubernetes pods..."
 
-    if [ $? -eq 0 ]; then
-        log_success "Test created: ${TEST_ID}"
-        echo "$response"
+        # Get all orchestrator pod names
+        local pod_names=$(kubectl get pods -l app=orchestrator -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -v '^$')
+
+        # Create tests in parallel using kubectl exec
+        local pids=()
+        local tmpdir=$(mktemp -d)
+        local json_payload="{\"test_id\":\"${TEST_ID}\",\"num_participants\":${num_participants},\"video\":{\"width\":1280,\"height\":720,\"fps\":30,\"bitrate_kbps\":2500,\"codec\":\"h264\"},\"audio\":{\"sample_rate\":48000,\"channels\":1,\"bitrate_kbps\":128,\"codec\":\"opus\"},\"duration_seconds\":${duration},\"backend_rtp_base_port\":\"5000\"}"
+
+        while IFS= read -r pod_name; do
+            if [ -n "$pod_name" ]; then
+                (
+                    kubectl exec "$pod_name" -- wget -q -O- --post-data="$json_payload" --header='Content-Type: application/json' "http://localhost:8080/api/v1/test/create" >/dev/null 2>&1 && echo "1" > "$tmpdir/$pod_name"
+                ) &
+                pids+=($!)
+            fi
+        done <<< "$pod_names"
+
+        # Wait for all background jobs
+        for pid in "${pids[@]}"; do
+            wait $pid 2>/dev/null || true
+        done
+
+        # Count successes
+        local created=$(ls -1 "$tmpdir" 2>/dev/null | wc -l | tr -d ' ')
+        rm -rf "$tmpdir"
+
+        if [ "$created" -gt 0 ]; then
+            # Each pod automatically handles its partition of participants
+            local total_participants=$((num_participants))
+            log_success "Test created on ${created}/${k8s_pods} pods: ${TEST_ID} (${total_participants} participants distributed across partitions)"
+        else
+            log_error "Failed to create test on any pod"
+            exit 1
+        fi
     else
-        log_error "Failed to create test"
-        exit 1
+        # Single pod or Docker mode
+        log_info "Creating test with ${num_participants} participants..."
+
+        local response=$(curl -sf -X POST "${BASE_URL}/api/v1/test/create" \
+            -H "Content-Type: application/json" \
+            -d "{
+                \"test_id\": \"${TEST_ID}\",
+                \"num_participants\": ${num_participants},
+                \"video\": {
+                    \"width\": 1280,
+                    \"height\": 720,
+                    \"fps\": 30,
+                    \"bitrate_kbps\": 2500,
+                    \"codec\": \"h264\"
+                },
+                \"audio\": {
+                    \"sample_rate\": 48000,
+                    \"channels\": 1,
+                    \"bitrate_kbps\": 128,
+                    \"codec\": \"opus\"
+                },
+                \"duration_seconds\": ${duration},
+                \"backend_rtp_base_port\": \"5000\"
+            }")
+
+        if [ $? -eq 0 ]; then
+            log_success "Test created: ${TEST_ID}"
+            echo "$response"
+        else
+            log_error "Failed to create test"
+            exit 1
+        fi
     fi
 }
 
 api_start_test() {
     log_info "Starting test..."
-    if curl -sf -X POST "${BASE_URL}/api/v1/test/${TEST_ID}/start" >/dev/null; then
-        log_success "Test started"
+
+    # Check if running in Kubernetes with multiple pods
+    local k8s_pods=$(kubectl get pods -l app=orchestrator --no-headers 2>/dev/null | grep -c "Running" || echo 0)
+
+    if [ "$k8s_pods" -gt 1 ]; then
+        local pod_names=$(kubectl get pods -l app=orchestrator -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -v '^$')
+
+        # Start tests in parallel using kubectl exec
+        local pids=()
+        local tmpdir=$(mktemp -d)
+
+        while IFS= read -r pod_name; do
+            if [ -n "$pod_name" ]; then
+                (
+                    kubectl exec "$pod_name" -- wget -q -O- --post-data='' "http://localhost:8080/api/v1/test/${TEST_ID}/start" >/dev/null 2>&1 && echo "1" > "$tmpdir/$pod_name"
+                ) &
+                pids+=($!)
+            fi
+        done <<< "$pod_names"
+
+        # Wait for all
+        for pid in "${pids[@]}"; do
+            wait $pid 2>/dev/null || true
+        done
+
+        local started=$(ls -1 "$tmpdir" 2>/dev/null | wc -l | tr -d ' ')
+        rm -rf "$tmpdir"
+
+        if [ "$started" -gt 0 ]; then
+            log_success "Test started on ${started}/${k8s_pods} pods"
+        else
+            log_error "Failed to start test on any pod"
+            exit 1
+        fi
     else
-        log_error "Failed to start test"
-        exit 1
+        if curl -sf -X POST "${BASE_URL}/api/v1/test/${TEST_ID}/start" >/dev/null; then
+            log_success "Test started"
+        else
+            log_error "Failed to start test"
+            exit 1
+        fi
     fi
 }
 
 api_stop_test() {
     log_info "Stopping test..."
-    local response=$(curl -sf -X POST "${BASE_URL}/api/v1/test/${TEST_ID}/stop")
-    if [ $? -eq 0 ]; then
-        log_success "Test stopped"
-        echo "$response"
+
+    # Check if running in Kubernetes with multiple pods
+    local k8s_pods=$(kubectl get pods -l app=orchestrator --no-headers 2>/dev/null | grep -c "Running" || echo 0)
+
+    if [ "$k8s_pods" -gt 1 ]; then
+        local pod_names=$(kubectl get pods -l app=orchestrator -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -v '^$')
+
+        # Stop tests in parallel using kubectl exec
+        local pids=()
+        local tmpdir=$(mktemp -d)
+
+        while IFS= read -r pod_name; do
+            if [ -n "$pod_name" ]; then
+                (
+                    kubectl exec "$pod_name" -- wget -q -O- --post-data='' "http://localhost:8080/api/v1/test/${TEST_ID}/stop" >/dev/null 2>&1 && echo "1" > "$tmpdir/$pod_name"
+                ) &
+                pids+=($!)
+            fi
+        done <<< "$pod_names"
+
+        # Wait for all
+        for pid in "${pids[@]}"; do
+            wait $pid 2>/dev/null || true
+        done
+
+        local stopped=$(ls -1 "$tmpdir" 2>/dev/null | wc -l | tr -d ' ')
+        rm -rf "$tmpdir"
+
+        log_success "Test stopped on ${stopped}/${k8s_pods} pods"
     else
-        log_warning "Failed to stop test gracefully"
+        local response=$(curl -sf -X POST "${BASE_URL}/api/v1/test/${TEST_ID}/stop")
+        if [ $? -eq 0 ]; then
+            log_success "Test stopped"
+            echo "$response"
+        else
+            log_warning "Failed to stop test gracefully"
+        fi
     fi
 }
 
 api_get_metrics() {
-    # Don't fail script if API call fails - return empty string
-    curl -sf "${BASE_URL}/api/v1/test/${TEST_ID}/metrics" 2>/dev/null || echo ""
+    # For Kubernetes: aggregate metrics from all pods
+    if kubectl get pods -l app=orchestrator >/dev/null 2>&1; then
+        local all_metrics=""
+        local total_frames=0 total_packets=0 total_bytes=0 total_bitrate=0
+        local total_jitter=0 total_loss=0 total_mos=0 total_participants=0
+        local pod_count=0
+        local state="unknown"
+
+        for pod_name in $(kubectl get pods -l app=orchestrator -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            local metrics=$(kubectl exec "$pod_name" -- wget -qO- "http://localhost:8080/api/v1/test/${TEST_ID}/metrics" 2>/dev/null || echo "")
+            if [ -n "$metrics" ] && echo "$metrics" | jq -e . >/dev/null 2>&1; then
+                # Extract and sum values
+                local agg=$(echo "$metrics" | jq -r '.aggregate // empty')
+                if [ -n "$agg" ]; then
+                    total_frames=$((total_frames + $(echo "$agg" | jq -r '.total_frames_sent // 0')))
+                    total_packets=$((total_packets + $(echo "$agg" | jq -r '.total_packets_sent // 0')))
+                    total_bytes=$((total_bytes + $(echo "$agg" | jq -r '.total_bytes_sent // 0')))
+                    total_bitrate=$((total_bitrate + $(echo "$agg" | jq -r '.total_bitrate_kbps // 0')))
+                    total_participants=$((total_participants + $(echo "$metrics" | jq -r '.participants | length // 0')))
+
+                    # For averages, accumulate for later division
+                    local jitter=$(echo "$agg" | jq -r '.avg_jitter_ms // 0')
+                    local loss=$(echo "$agg" | jq -r '.avg_packet_loss // 0')
+                    local mos=$(echo "$agg" | jq -r '.avg_mos_score // 0')
+                    total_jitter=$(echo "$total_jitter + $jitter" | bc 2>/dev/null || echo "$total_jitter")
+                    total_loss=$(echo "$total_loss + $loss" | bc 2>/dev/null || echo "$total_loss")
+                    total_mos=$(echo "$total_mos + $mos" | bc 2>/dev/null || echo "$total_mos")
+
+                    state=$(echo "$metrics" | jq -r '.state // "unknown"')
+                    pod_count=$((pod_count + 1))
+                fi
+            fi
+        done
+
+        # Calculate averages
+        if [ $pod_count -gt 0 ]; then
+            local avg_jitter=$(echo "scale=2; $total_jitter / $pod_count" | bc 2>/dev/null || echo "0")
+            local avg_loss=$(echo "scale=2; $total_loss / $pod_count" | bc 2>/dev/null || echo "0")
+            local avg_mos=$(echo "scale=2; $total_mos / $pod_count" | bc 2>/dev/null || echo "0")
+
+            # Return aggregated JSON
+            cat <<EOF
+{
+    "test_id": "${TEST_ID}",
+    "state": "${state}",
+    "aggregate": {
+        "total_frames_sent": ${total_frames},
+        "total_packets_sent": ${total_packets},
+        "total_bytes_sent": ${total_bytes},
+        "total_bitrate_kbps": ${total_bitrate},
+        "avg_jitter_ms": ${avg_jitter},
+        "avg_packet_loss": ${avg_loss},
+        "avg_mos_score": ${avg_mos}
+    },
+    "participants": $(printf '%.0s{"id":1},' $(seq 1 $total_participants) | sed 's/,$//' | sed 's/^/[/;s/$/]/')
+}
+EOF
+        else
+            echo ""
+        fi
+    else
+        # Docker mode: single endpoint
+        curl -sf "${BASE_URL}/api/v1/test/${TEST_ID}/metrics" 2>/dev/null || echo ""
+    fi
 }
 
 api_inject_spike() {
@@ -485,7 +686,16 @@ setup_grafana_dashboard() {
 
     log_info "Setting up Grafana monitoring..."
 
-    if ! curl -sf "${GRAFANA_URL}/api/healthz" >/dev/null 2>&1; then
+    # Ensure kubectl port-forward is running for Grafana in K8s mode
+    if command -v kubectl &> /dev/null && ! pgrep -f "kubectl port-forward.*3000" > /dev/null 2>&1; then
+        if timeout 3 kubectl get pods -l app=grafana --no-headers 2>/dev/null | grep -q "Running"; then
+            log_info "Restarting kubectl port-forward for Grafana..."
+            nohup kubectl port-forward svc/grafana 3000:3000 > /dev/null 2>&1 &
+            sleep 2
+        fi
+    fi
+
+    if ! curl -sf --max-time 3 "${GRAFANA_URL}/api/health" >/dev/null 2>&1; then
         log_warning "Grafana not accessible at ${GRAFANA_URL}"
         log_warning "Start it with: docker-compose --profile monitoring up -d"
         return
@@ -516,7 +726,7 @@ register_prometheus_target() {
     local test_id=$1
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local project_root="$(cd "$script_dir/.." && pwd)"
-    local targets_dir="${project_root}/config/prometheus-targets"
+    local targets_dir="${project_root}/config/prometheus/targets"
 
     mkdir -p "$targets_dir"
 
@@ -562,7 +772,7 @@ unregister_prometheus_target() {
     local test_id=$1
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local project_root="$(cd "$script_dir/.." && pwd)"
-    local targets_dir="${project_root}/config/prometheus-targets"
+    local targets_dir="${project_root}/config/prometheus/targets"
     local target_file="${targets_dir}/${test_id}.json"
 
     if [ -f "$target_file" ]; then
@@ -574,7 +784,7 @@ unregister_prometheus_target() {
 cleanup_old_prometheus_targets() {
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local project_root="$(cd "$script_dir/.." && pwd)"
-    local targets_dir="${project_root}/config/prometheus-targets"
+    local targets_dir="${project_root}/config/prometheus/targets"
 
     if [ ! -d "$targets_dir" ]; then
         return
@@ -604,46 +814,67 @@ check_port_conflict() {
 
     while IFS= read -r line; do
         cmd=$(echo "$line" | awk '{print $1}')
+        # Allow Docker, kubectl (port-forward), and orchestrator processes
         if [[ "$cmd" != *"docke"* ]] && [[ "$cmd" != *"com.docke"* ]] && \
            [[ "$line" != *"chaos-monkey-orchestrator"* ]] && \
-           [[ "$cmd" != *"Docker"* ]]; then
+           [[ "$cmd" != *"Docker"* ]] && \
+           [[ "$cmd" != *"kubectl"* ]]; then
             conflict=true
             conflicting_processes="$conflicting_processes\n$line"
         fi
     done < <(lsof -i :${port} 2>/dev/null | grep LISTEN || true)
 
     if [ "$conflict" = true ]; then
-        log_warning "Port ${port} is already in use by a non-Docker process!"
-        log_warning "This will conflict with the Docker orchestrator."
+        log_warning "Port ${port} is already in use by a non-Docker/Kubernetes process!"
+        log_warning "This will conflict with the orchestrator."
         echo ""
         echo "Processes using port ${port}:"
         echo -e "$conflicting_processes"
         echo ""
-        log_error "Please stop the host orchestrator process or use Docker only."
+        log_error "Please stop the conflicting process or use Docker/Kubernetes."
         log_info "To use Docker: docker-compose --profile monitoring up -d"
+        log_info "To use Kubernetes: ./scripts/start_k8s.sh"
         log_info "To check: lsof -i :8080"
         return 1
     fi
 
+    # Check for Docker orchestrator
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'chaos-monkey-orchestrator|choas-monkey-orchestrator'; then
         log_info "Docker orchestrator is running ✓"
         return 0
-    else
-        log_warning "Docker orchestrator is not running"
-        log_info "Start it with: docker-compose --profile monitoring up -d orchestrator"
-        return 1
     fi
+
+    # Check for Kubernetes orchestrator pods (kubectl port-forward)
+    if command -v kubectl &> /dev/null; then
+        local running_pods=$(timeout 5 kubectl get pods -l app=orchestrator --no-headers 2>/dev/null | grep -c "Running" 2>/dev/null | tr -d '[:space:]')
+        running_pods=${running_pods:-0}
+        if [ "$running_pods" -gt 0 ] 2>/dev/null; then
+            log_info "Kubernetes orchestrator pods running (${running_pods} pods) ✓"
+            return 0
+        fi
+    fi
+
+    # Check if kubectl port-forward is running on 8080 (means K8s is set up)
+    if pgrep -f "kubectl port-forward.*8080" > /dev/null 2>&1; then
+        log_info "Kubernetes port-forward is active ✓"
+        return 0
+    fi
+
+    log_warning "No orchestrator detected (Docker or Kubernetes)"
+    log_info "Start Docker: docker-compose --profile monitoring up -d orchestrator"
+    log_info "Start Kubernetes: ./scripts/start_k8s.sh"
+    return 1
 }
 
 main() {
     clear
 
     log_info "Configuration:"
-    echo "  Participants: ${BOLD}${NUM_PARTICIPANTS}${NC}"
-    echo "  Test Duration: ${BOLD}${TEST_DURATION_SECONDS}s${NC}"
-    echo "  Number of Spikes: ${BOLD}${NUM_SPIKES}${NC}"
-    echo "  Chaos Intensity: ${BOLD}${CHAOS_INTENSITY}${NC}"
-    echo "  Test ID: ${BOLD}${TEST_ID}${NC}"
+    echo -e "  Participants: ${BOLD}${NUM_PARTICIPANTS}${NC}"
+    echo -e "  Test Duration: ${BOLD}${TEST_DURATION_SECONDS}s${NC}"
+    echo -e "  Number of Spikes: ${BOLD}${NUM_SPIKES}${NC}"
+    echo -e "  Chaos Intensity: ${BOLD}${CHAOS_INTENSITY}${NC}"
+    echo -e "  Test ID: ${BOLD}${TEST_ID}${NC}"
     echo ""
 
     log_info "Running pre-flight checks..."
@@ -666,7 +897,8 @@ main() {
 
     if ! check_api_health; then
         log_error "API server is not healthy at ${BASE_URL}"
-        log_error "Start the Docker orchestrator with: docker-compose --profile monitoring up -d orchestrator"
+        log_error "Start Docker orchestrator: docker-compose --profile monitoring up -d orchestrator"
+        log_error "Start Kubernetes orchestrator: ./scripts/start_k8s.sh"
         log_error "Or if running locally: ./chaos-monkey -http :8080"
         exit 1
     fi
