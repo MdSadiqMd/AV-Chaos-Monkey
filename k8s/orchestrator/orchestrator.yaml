@@ -21,47 +21,51 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       containers:
-      - name: orchestrator
-        image: chaos-monkey-orchestrator:latest
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8080
-          name: http
-        env:
-        - name: LOG_LEVEL
-          value: "info"
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: TOTAL_PARTITIONS
-          value: "10"
-        resources:
-          requests:
-            cpu: "1"
-            memory: "2Gi"
-          limits:
-            cpu: "4"
-            memory: "2Gi"
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
-        command:
-        - /bin/sh
-        - -c
-        - |
-          export PARTITION_ID=$(echo $POD_NAME | grep -o '[0-9]*$')
-          echo "Starting orchestrator partition $PARTITION_ID of $TOTAL_PARTITIONS"
-          exec /usr/local/bin/orchestrator -http :8080
+        - name: orchestrator
+          image: chaos-monkey-orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: LOG_LEVEL
+              value: "info"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TOTAL_PARTITIONS
+              value: "10"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              PARTITION_ID=$(echo "$POD_NAME" | sed 's/.*-//')
+              if [ -z "$PARTITION_ID" ] || ! echo "$PARTITION_ID" | grep -qE '^[0-9]+$'; then
+                PARTITION_ID=0
+              fi
+              echo "Starting orchestrator partition $PARTITION_ID of $TOTAL_PARTITIONS" >&2
+              exec env PARTITION_ID="$PARTITION_ID" /usr/bin/dumb-init -- /usr/local/bin/orchestrator -http :8080
 ---
 apiVersion: v1
 kind: Service
@@ -72,10 +76,10 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-  - port: 8080
-    targetPort: 8080
-    protocol: TCP
-    name: http
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
   selector:
     app: orchestrator
 ---
@@ -88,8 +92,8 @@ metadata:
 spec:
   clusterIP: None
   ports:
-  - port: 8080
-    targetPort: 8080
-    name: http
+    - port: 8080
+      targetPort: 8080
+      name: http
   selector:
     app: orchestrator
