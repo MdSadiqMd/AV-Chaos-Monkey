@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-NUM_PARTICIPANTS=250
-TEST_DURATION_SECONDS=600
+NUM_PARTICIPANTS=${NUM_PARTICIPANTS:-250}
+TEST_DURATION_SECONDS=${TEST_DURATION_SECONDS:-600}
 
-SKIP_TEST=false
-AUTO_DETECT_PARTICIPANTS=true
+SKIP_TEST=${SKIP_TEST:-false}
+AUTO_DETECT_PARTICIPANTS=${AUTO_DETECT_PARTICIPANTS:-true}
+USE_K8S=${USE_K8S:-false}
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,6 +26,25 @@ log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[⚠]${NC} $1"; }
 log_error() { echo -e "${RED}[✗]${NC} $1"; }
 log_config() { echo -e "${MAGENTA}[CONFIG]${NC} $1"; }
+
+# Handle --k8s flag for Kubernetes mode
+for arg in "$@"; do
+    case $arg in
+        --k8s|--kubernetes)
+            USE_K8S=true
+            shift
+            ;;
+        --skip-test)
+            SKIP_TEST=true
+            shift
+            ;;
+    esac
+done
+
+if [ "$USE_K8S" = true ]; then
+    echo -e "${BOLD}${CYAN}Kubernetes mode enabled - 3x throughput${NC}"
+    exec "$SCRIPT_DIR/start_k8s.sh" "$@"
+fi
 
 detect_docker_memory() {
     local docker_mem_gb=8
@@ -248,7 +268,7 @@ if [ "$services_ok" = false ]; then
 fi
 
 log_info "Step 6: Cleaning up old Prometheus targets..."
-find config/prometheus-targets -name "*.json" -delete 2>/dev/null || true
+find config/prometheus/targets -name "*.json" -delete 2>/dev/null || true
 docker restart chaos-monkey-prometheus >/dev/null 2>&1 || true
 sleep 2
 log_success "Prometheus targets cleaned"
