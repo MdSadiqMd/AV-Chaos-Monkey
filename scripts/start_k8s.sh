@@ -149,17 +149,36 @@ detect_and_configure() {
 check_prerequisites() {
     log_info "Checking prerequisites..."
     
-    if ! command -v kubectl &> /dev/null; then
-        log_error "kubectl not found. Install with: brew install kubectl"
+    # Find kubectl and kind
+    KUBECTL_CMD=$(command -v kubectl || which kubectl || echo "")
+    KIND_CMD=$(command -v kind || which kind || echo "")
+    
+    if [ -z "$KUBECTL_CMD" ] || [ -z "$KIND_CMD" ]; then
+        log_error "kubectl/kind not found. Make sure you're in Nix devShell: nix develop"
+        exit 1
     fi
     
-    if ! command -v docker &> /dev/null; then
-        log_error "docker not found. Install Docker Desktop."
+    # Ensure Docker is running
+    if ! "$SCRIPT_DIR/ensure-docker.sh"; then
+        log_error "Docker is required but not running"
+        log_info "Please start Docker Desktop manually, then run this script again"
+        exit 1
     fi
     
-    if ! kubectl cluster-info &> /dev/null; then
-        log_error "Kubernetes cluster not available. Enable Kubernetes in Docker Desktop:
-  Settings → Kubernetes → Enable Kubernetes"
+    # Auto-setup kind cluster if not exists
+    CLUSTER_NAME="${CLUSTER_NAME:-av-chaos-monkey}"
+    if ! "$KIND_CMD" get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+        log_info "Setting up Kubernetes cluster..."
+        "$SCRIPT_DIR/k8s-kind-setup.sh" || exit 1
+    fi
+    
+    # Use kind cluster
+    "$KUBECTL_CMD" config use-context "kind-${CLUSTER_NAME}" 2>/dev/null || true
+    
+    if ! "$KUBECTL_CMD" cluster-info &> /dev/null; then
+        log_error "Kubernetes cluster not accessible"
+        log_info "Try: ./scripts/k8s-kind-setup.sh"
+        exit 1
     fi
     
     log_success "Prerequisites OK"
@@ -170,6 +189,33 @@ build_image() {
     cd "$PROJECT_ROOT"
     docker build -t chaos-monkey-orchestrator:latest . --quiet
     log_success "Docker image built"
+    
+    # Load image into kind cluster (required for kind)
+    CLUSTER_NAME="${CLUSTER_NAME:-av-chaos-monkey}"
+    KIND_CMD=$(command -v kind || which kind || echo "")
+    if [ -n "$KIND_CMD" ] && "$KIND_CMD" get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+        log_info "Loading image into kind cluster..."
+        "$KIND_CMD" load docker-image chaos-monkey-orchestrator:latest --name "${CLUSTER_NAME}" || {
+            log_error "Failed to load image into kind cluster"
+            exit 1
+        }
+        log_success "Image loaded into kind cluster"
+    fi
+}
+
+# Helper to reload image into kind (useful for updates)
+reload_image() {
+    CLUSTER_NAME="${CLUSTER_NAME:-av-chaos-monkey}"
+    KIND_CMD=$(command -v kind || which kind || echo "")
+    if [ -n "$KIND_CMD" ] && "$KIND_CMD" get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+        log_info "Reloading image into kind cluster..."
+        "$KIND_CMD" load docker-image chaos-monkey-orchestrator:latest --name "${CLUSTER_NAME}"
+        log_success "Image reloaded"
+        
+        # Restart pods to use new image
+        log_info "Restarting orchestrator pods..."
+        kubectl rollout restart statefulset/orchestrator 2>/dev/null || true
+    fi
 }
 
 # Generate StatefulSet YAML dynamically
@@ -367,6 +413,8 @@ deploy_k8s() {
     
     log_info "Waiting for pods to be ready..."
     kubectl wait --for=condition=ready pod -l app=orchestrator --timeout=120s
+    kubectl wait --for=condition=ready pod -l app=prometheus --timeout=120s 2>/dev/null || true
+    kubectl wait --for=condition=ready pod -l app=grafana --timeout=120s 2>/dev/null || true
     
     log_success "Kubernetes deployment ready"
 }
@@ -511,14 +559,24 @@ setup_port_forward() {
         local local_port=$2
         local remote_port=$3
         local health_endpoint=$4
+        local max_retries=${5:-10}  # Default 10, but can be overridden for Grafana
         
         log_info "Starting port-forward for ${service}..."
+        
+        # Wait for pod to be ready (especially important for Grafana)
+        if [ "$service" = "grafana" ]; then
+            log_info "Waiting for Grafana pod to be ready..."
+            kubectl wait --for=condition=ready pod -l app=grafana --timeout=60s >/dev/null 2>&1 || {
+                log_warning "Grafana pod not ready yet, but continuing..."
+            }
+        fi
+        
         nohup kubectl port-forward "svc/${service}" "${local_port}:${remote_port}" >/dev/null 2>&1 &
         local pf_pid=$!
+        sleep 2  # Give port-forward a moment to establish
         
         # Wait for port-forward to be ready
         local retries=0
-        local max_retries=10
         while [ $retries -lt $max_retries ]; do
             if curl -sf --max-time 2 "http://localhost:${local_port}${health_endpoint}" >/dev/null 2>&1; then
                 log_success "${service} port-forward ready (PID: $pf_pid)"
@@ -528,14 +586,26 @@ setup_port_forward() {
             retries=$((retries + 1))
         done
         
-        log_warning "${service} port-forward may not be working"
+        # For Grafana, check if pod is running but just needs more time
+        if [ "$service" = "grafana" ]; then
+            local grafana_status=$(kubectl get pods -l app=grafana -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Unknown")
+            if [ "$grafana_status" = "Running" ]; then
+                log_warning "Grafana pod is running but health check failed. It may need more time to start."
+                log_info "You can manually check: kubectl port-forward svc/grafana 3000:3000"
+            else
+                log_warning "Grafana pod status: $grafana_status"
+            fi
+        else
+            log_warning "${service} port-forward may not be working"
+        fi
         return 1
     }
     
     # Start port-forwards with verification
-    start_and_verify_pf "orchestrator" "8080" "8080" "/healthz"
-    start_and_verify_pf "prometheus" "9091" "9090" "/-/healthy"
-    start_and_verify_pf "grafana" "3000" "3000" "/api/health"
+    # Grafana gets more retries since it takes longer to start
+    start_and_verify_pf "orchestrator" "8080" "8080" "/healthz" 10
+    start_and_verify_pf "prometheus" "9091" "9090" "/-/healthy" 10
+    start_and_verify_pf "grafana" "3000" "3000" "/api/health" 30
     
     echo ""
     log_success "Port forwarding active"
@@ -573,10 +643,23 @@ cleanup() {
     kubectl delete -f "$K8S_DIR/monitoring/prometheus-rbac.yaml" --ignore-not-found=true
     kubectl delete configmap grafana-dashboard --ignore-not-found=true
     pkill -f "kubectl port-forward" 2>/dev/null || true
+    log_success "Kubernetes resources cleaned up"
+    
+    # Cleanup kind cluster after development (default behavior)
+    if [ "${SKIP_KIND_CLEANUP:-false}" != "true" ]; then
+        log_info "Cleaning up kind cluster..."
+        "$SCRIPT_DIR/k8s-kind-cleanup.sh" || true
+        log_success "Kind cluster cleaned up"
+    fi
+    
     log_success "Cleanup complete"
 }
 
 if [ "${1:-}" = "--cleanup" ] || [ "${1:-}" = "cleanup" ]; then
+    # Skip kind cleanup only if --no-kind flag is provided
+    if [ "${2:-}" = "--no-kind" ] || [ "${2:-}" = "no-kind" ]; then
+        SKIP_KIND_CLEANUP="true"
+    fi
     cleanup
     exit 0
 fi
