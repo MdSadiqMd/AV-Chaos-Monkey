@@ -7,7 +7,7 @@
   "version": 4,
   "refresh": "5s",
   "time": {
-    "from": "now-15m",
+    "from": "now-5m",
     "to": "now"
   },
   "panels": [
@@ -612,9 +612,9 @@
     },
     {
       "id": 30,
-      "title": "Frames by Partition",
+      "title": "Frames by Partition (Time Series - Bar Chart)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -626,9 +626,11 @@
       ],
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": ["last", "max"],
+          "calcs": ["last", "max"]
         },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
@@ -640,15 +642,15 @@
             "axisColorMode": "text",
             "axisLabel": "Frames",
             "axisPlacement": "auto",
-            "drawStyle": "line",
-            "fillOpacity": 10,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 90,
             "gradientMode": "none",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 1,
+            "lineWidth": 1,
+            "pointSize": 5,
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
+            "stacking": { "group": "A", "mode": "normal" },
             "thresholdsStyle": { "mode": "off" }
           },
           "unit": "short"
@@ -656,10 +658,242 @@
       }
     },
     {
-      "id": 31,
-      "title": "Participants by Partition",
+      "id": 32,
+      "title": "Participants Distribution (Pie Chart)",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rtp_active_participants{test_id=~\"$test_id\"}",
+          "legendFormat": "Partition {{partition}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "pieType": "pie",
+        "tooltip": { "mode": "single" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": ["value"]
+        },
+        "displayLabels": ["name", "value", "percent"]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short",
+          "decimals": 0
+        }
+      }
+    },
+    {
+      "id": 33,
+      "title": "Partition Distribution Summary Table",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rtp_active_participants{test_id=~\"$test_id\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{partition}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rtp_frames_sent_total{test_id=~\"$test_id\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{partition}}",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "desc": false, "displayName": "Partition" }]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "displayMode": "color-background",
+            "inspect": false
+          },
+          "mappings": [],
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "partition" },
+            "properties": [
+              { "id": "custom.width", "value": 120 },
+              { "id": "custom.displayMode", "value": "color-background" },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0": { "text": "Partition 0", "color": "blue" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "1": { "text": "Partition 1", "color": "green" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "2": { "text": "Partition 2", "color": "yellow" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "3": { "text": "Partition 3", "color": "orange" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "4": { "text": "Partition 4", "color": "red" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "5": { "text": "Partition 5", "color": "purple" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "6": { "text": "Partition 6", "color": "pink" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "7": { "text": "Partition 7", "color": "cyan" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "8": { "text": "Partition 8", "color": "brown" }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "9": { "text": "Partition 9", "color": "gray" }
+                    },
+                    "type": "value"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Value #A/" },
+            "properties": [
+              { "id": "displayName", "value": "Participants" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" },
+              { "id": "custom.width", "value": 150 },
+              { "id": "unit", "value": "short" },
+              { "id": "decimals", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Value #B/" },
+            "properties": [
+              { "id": "displayName", "value": "Frames" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" },
+              { "id": "custom.width", "value": 150 },
+              { "id": "unit", "value": "short" },
+              { "id": "decimals", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "partition": {
+                "aggregations": [],
+                "operation": "groupby"
+              },
+              "Value #A": {
+                "aggregations": ["lastNotNull"],
+                "operation": "aggregate"
+              },
+              "Value #B": {
+                "aggregations": ["lastNotNull"],
+                "operation": "aggregate"
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "test_id": true,
+              "instance": true,
+              "job": true
+            },
+            "indexByName": {
+              "partition": 0,
+              "Value #A (lastNotNull)": 1,
+              "Value #B (lastNotNull)": 2
+            },
+            "renameByName": {
+              "partition": "Partition",
+              "Value #A (lastNotNull)": "Participants",
+              "Value #B (lastNotNull)": "Frames"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "desc": false,
+                "field": "Partition"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "Participants by Partition (Time Series - Bars)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -671,9 +905,11 @@
       ],
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": ["last", "max"],
+          "calcs": ["last", "max"]
         },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
@@ -685,18 +921,19 @@
             "axisColorMode": "text",
             "axisLabel": "Participants",
             "axisPlacement": "auto",
-            "drawStyle": "line",
-            "fillOpacity": 10,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 90,
             "gradientMode": "none",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 1,
+            "lineWidth": 1,
+            "pointSize": 5,
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
+            "stacking": { "group": "A", "mode": "normal" },
             "thresholdsStyle": { "mode": "off" }
           },
-          "unit": "short"
+          "unit": "short",
+          "decimals": 0
         }
       }
     }
