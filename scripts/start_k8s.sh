@@ -502,19 +502,42 @@ setup_port_forward() {
     log_info "Setting up port forwarding..."
     
     # Kill any existing port-forwards
-    pkill -f "kubectl port-forward" 2>/dev/null || true
-    sleep 1
-    
-    # Forward orchestrator (load balanced via service)
-    kubectl port-forward svc/orchestrator 8080:8080 &>/dev/null &
-    
-    # Forward Prometheus
-    kubectl port-forward svc/prometheus 9091:9090 &>/dev/null &
-    
-    # Forward Grafana
-    kubectl port-forward svc/grafana 3000:3000 &>/dev/null &
-    
+    pkill -9 -f "kubectl port-forward" 2>/dev/null || true
     sleep 2
+    
+    # Function to start a port-forward and verify it works
+    start_and_verify_pf() {
+        local service=$1
+        local local_port=$2
+        local remote_port=$3
+        local health_endpoint=$4
+        
+        log_info "Starting port-forward for ${service}..."
+        nohup kubectl port-forward "svc/${service}" "${local_port}:${remote_port}" >/dev/null 2>&1 &
+        local pf_pid=$!
+        
+        # Wait for port-forward to be ready
+        local retries=0
+        local max_retries=10
+        while [ $retries -lt $max_retries ]; do
+            if curl -sf --max-time 2 "http://localhost:${local_port}${health_endpoint}" >/dev/null 2>&1; then
+                log_success "${service} port-forward ready (PID: $pf_pid)"
+                return 0
+            fi
+            sleep 1
+            retries=$((retries + 1))
+        done
+        
+        log_warning "${service} port-forward may not be working"
+        return 1
+    }
+    
+    # Start port-forwards with verification
+    start_and_verify_pf "orchestrator" "8080" "8080" "/healthz"
+    start_and_verify_pf "prometheus" "9091" "9090" "/-/healthy"
+    start_and_verify_pf "grafana" "3000" "3000" "/api/health"
+    
+    echo ""
     log_success "Port forwarding active"
     echo -e "  Orchestrator: ${CYAN}http://localhost:8080${NC}"
     echo -e "  Prometheus:   ${CYAN}http://localhost:9091${NC}"

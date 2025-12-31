@@ -679,6 +679,88 @@ display_metrics_summary() {
     fi
 }
 
+ensure_k8s_port_forwards() {
+    # Only run if kubectl is available and K8s pods are running
+    if ! command -v kubectl &> /dev/null; then
+        return 0
+    fi
+
+    # Check if orchestrator pods exist (indicates K8s mode)
+    if ! timeout 3 kubectl get pods -l app=orchestrator --no-headers 2>/dev/null | grep -q "Running"; then
+        return 0
+    fi
+
+    log_info "Ensuring Kubernetes port-forwards are healthy..."
+
+    # Function to check and restart a specific port-forward
+    restart_port_forward_if_needed() {
+        local service=$1
+        local local_port=$2
+        local remote_port=$3
+        local test_url=$4
+        local test_path=$5
+
+        # Check if port-forward process exists and is not suspended
+        local pf_pid=$(pgrep -f "kubectl port-forward.*${service}.*${local_port}" 2>/dev/null | head -1)
+        local needs_restart=false
+
+        if [ -n "$pf_pid" ]; then
+            # Check if process is suspended (state T)
+            local state=$(ps -o stat= -p "$pf_pid" 2>/dev/null | grep -o '^[A-Z]')
+            if [ "$state" = "T" ]; then
+                log_info "Port-forward for ${service} is suspended, restarting..."
+                kill -9 "$pf_pid" 2>/dev/null || true
+                needs_restart=true
+            fi
+        else
+            needs_restart=true
+        fi
+
+        # Test if the service is actually accessible
+        if [ "$needs_restart" = "false" ]; then
+            if ! curl -sf --max-time 2 "${test_url}${test_path}" >/dev/null 2>&1; then
+                log_info "Port-forward for ${service} not responding, restarting..."
+                [ -n "$pf_pid" ] && kill -9 "$pf_pid" 2>/dev/null || true
+                needs_restart=true
+            fi
+        fi
+
+        # Restart if needed
+        if [ "$needs_restart" = "true" ]; then
+            nohup kubectl port-forward "svc/${service}" "${local_port}:${remote_port}" >/dev/null 2>&1 &
+            sleep 1
+
+            # Verify it started
+            local retries=0
+            while [ $retries -lt 5 ]; do
+                if curl -sf --max-time 2 "${test_url}${test_path}" >/dev/null 2>&1; then
+                    return 0
+                fi
+                sleep 1
+                retries=$((retries + 1))
+            done
+
+            log_warning "Failed to verify ${service} port-forward"
+            return 1
+        fi
+
+        return 0
+    }
+
+    # Ensure all port-forwards are healthy
+    local all_healthy=true
+
+    restart_port_forward_if_needed "orchestrator" "8080" "8080" "http://localhost:8080" "/healthz" || all_healthy=false
+    restart_port_forward_if_needed "prometheus" "9091" "9090" "http://localhost:9091" "/-/healthy" || all_healthy=false
+    restart_port_forward_if_needed "grafana" "3000" "3000" "http://localhost:3000" "/api/health" || all_healthy=false
+
+    if [ "$all_healthy" = "true" ]; then
+        log_success "All Kubernetes port-forwards are healthy"
+    else
+        log_warning "Some port-forwards may not be working properly"
+    fi
+}
+
 setup_grafana_dashboard() {
     if [ "${ENABLE_GRAFANA}" != "true" ]; then
         return
@@ -686,18 +768,17 @@ setup_grafana_dashboard() {
 
     log_info "Setting up Grafana monitoring..."
 
-    # Ensure kubectl port-forward is running for Grafana in K8s mode
-    if command -v kubectl &> /dev/null && ! pgrep -f "kubectl port-forward.*3000" > /dev/null 2>&1; then
-        if timeout 3 kubectl get pods -l app=grafana --no-headers 2>/dev/null | grep -q "Running"; then
-            log_info "Restarting kubectl port-forward for Grafana..."
-            nohup kubectl port-forward svc/grafana 3000:3000 > /dev/null 2>&1 &
-            sleep 2
-        fi
-    fi
+    # Ensure port-forwards are healthy (for K8s mode)
+    ensure_k8s_port_forwards
 
     if ! curl -sf --max-time 3 "${GRAFANA_URL}/api/health" >/dev/null 2>&1; then
         log_warning "Grafana not accessible at ${GRAFANA_URL}"
-        log_warning "Start it with: docker-compose --profile monitoring up -d"
+        if command -v kubectl &> /dev/null && timeout 3 kubectl get pods -l app=grafana --no-headers 2>/dev/null | grep -q "Running"; then
+            log_warning "Grafana pod is running but port-forward may be broken"
+            log_warning "Try running: ./scripts/start_k8s.sh"
+        else
+            log_warning "Start it with: docker-compose --profile monitoring up -d"
+        fi
         return
     fi
 
@@ -919,6 +1000,7 @@ main() {
     local spike_count=0
     local next_spike_time=$((start_time + SPIKE_INTERVAL_SECONDS))
     local last_metrics_update=0
+    local last_pf_check=0
 
     log_success "Test is running! Injecting chaos..."
     echo ""
@@ -930,6 +1012,12 @@ main() {
 
         if [ $current_time -ge $end_time ]; then
             break
+        fi
+
+        # Periodically check port-forwards health (every 30 seconds)
+        if [ $((current_time - last_pf_check)) -ge 30 ]; then
+            ensure_k8s_port_forwards >/dev/null 2>&1 || true
+            last_pf_check=$current_time
         fi
 
         if [ $current_time -ge $next_spike_time ] && [ $spike_count -lt $NUM_SPIKES ]; then
