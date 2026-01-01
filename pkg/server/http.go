@@ -156,6 +156,20 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	participantPool := pool.NewParticipantPool(req.TestId)
+
+	udpTargetHost := os.Getenv("UDP_TARGET_HOST")
+	udpTargetPort := getEnvInt("UDP_TARGET_PORT", 0)
+	if udpTargetHost != "" && udpTargetPort > 0 {
+		participantPool.SetTarget(udpTargetHost, udpTargetPort)
+		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d", udpTargetHost, udpTargetPort)
+	} else if udpTargetPort > 0 {
+		// If only port is set, use localhost
+		participantPool.SetTarget("127.0.0.1", udpTargetPort)
+		log.Printf("[HTTP] UDP transmission enabled: target=127.0.0.1:%d", udpTargetPort)
+	} else {
+		log.Printf("[HTTP] UDP transmission disabled (set UDP_TARGET_HOST and UDP_TARGET_PORT to enable)")
+	}
+
 	basePort := 5000
 	if req.BackendRtpBasePort != "" {
 		fmt.Sscanf(req.BackendRtpBasePort, "%d", &basePort)

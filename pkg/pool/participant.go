@@ -133,11 +133,18 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 		activeSpikes:   make(map[string]*pb.SpikeEvent),
 	}
 
-	// Set up UDP socket for real packet transmission
+	targetHost := "127.0.0.1"
+	targetPort := backendPort
 	if pp.targetPort > 0 {
-		if err := participant.SetupUDP(pp.targetHost, backendPort); err != nil {
-			log.Printf("[Pool] Warning: Failed to setup UDP for participant %d: %v (falling back to simulation)", id, err)
-		}
+		// Use configured target for forwarding to external application
+		targetHost = pp.targetHost
+		targetPort = pp.targetPort
+	}
+
+	if err := participant.SetupUDP(targetHost, targetPort); err != nil {
+		log.Printf("[Pool] Warning: Failed to setup UDP for participant %d: %v (falling back to simulation)", id, err)
+	} else {
+		log.Printf("[Pool] Participant %d: UDP enabled, sending RTP packets to %s:%d", id, targetHost, targetPort)
 	}
 
 	pp.participants[id] = participant
