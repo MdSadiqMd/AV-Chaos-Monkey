@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  labels:
+    app: coturn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coturn
+  template:
+    metadata:
+      labels:
+        app: coturn
+    spec:
+      containers:
+        - name: coturn
+          image: coturn/coturn:latest
+          ports:
+            - containerPort: 3478
+              name: turn-tcp
+              protocol: TCP
+            - containerPort: 3478
+              name: turn-udp
+              protocol: UDP
+            - containerPort: 49152
+              name: relay-start
+              protocol: UDP
+          env:
+            - name: TURN_USERNAME
+              value: "webrtc"
+            - name: TURN_PASSWORD
+              value: "webrtc123"
+            - name: EXTERNAL_IP
+              value: "" # Will be set if needed
+          command:
+            - /bin/sh
+            - -c
+            - |
+              turnserver -n \
+                --log-file=stdout \
+                --listening-ip=0.0.0.0 \
+                --listening-port=3478 \
+                --min-port=49152 \
+                --max-port=65535 \
+                --user=${TURN_USERNAME}:${TURN_PASSWORD} \
+                --realm=chaos-monkey.local \
+                --no-cli \
+                --no-tls \
+                --no-dtls \
+                --fingerprint \
+                --lt-cred-mech \
+                --server-name=chaos-monkey-turn
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coturn
+  labels:
+    app: coturn
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3478
+      targetPort: 3478
+      protocol: TCP
+      name: turn-tcp
+    - port: 3478
+      targetPort: 3478
+      protocol: UDP
+      name: turn-udp
+  selector:
+    app: coturn
