@@ -71,6 +71,44 @@ services:
     profiles:
       - monitoring
 
+  coturn:
+    image: coturn/coturn:latest
+    container_name: chaos-monkey-coturn
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49152-65535:49152-65535/udp"
+    environment:
+      - TURN_USERNAME=webrtc
+      - TURN_PASSWORD=webrtc123
+      - EXTERNAL_IP=${EXTERNAL_IP:-}
+    command:
+      - -n
+      - --log-file=stdout
+      - --listening-ip=0.0.0.0
+      - --listening-port=3478
+      - --min-port=49152
+      - --max-port=65535
+      - --user=${TURN_USERNAME:-webrtc}:${TURN_PASSWORD:-webrtc123}
+      - --realm=chaos-monkey.local
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --fingerprint
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:-chaos-monkey-secret}
+      - --server-name=chaos-monkey-turn
+    networks:
+      - simulator
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "timeout", "1", "nc", "-u", "-z", "localhost", "3478"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
 networks:
   simulator:
     driver: bridge
