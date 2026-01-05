@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.23-alpine AS builder
+FROM golang:1.22-alpine AS builder
 
 # Since CGO_ENABLED=0, we don't need build-base (gcc) - saves time and space
 RUN apk add --no-cache \
