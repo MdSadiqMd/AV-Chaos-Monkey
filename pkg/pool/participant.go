@@ -65,6 +65,10 @@ type ParticipantPool struct {
 	targetHost string
 	targetPort int
 
+	// WebRTC participants (separate from UDP participants)
+	webrtcParticipantsMu sync.RWMutex
+	webrtcParticipants   map[uint32]WebRTCParticipant
+
 	// Cached aggregate metrics for fast retrieval
 	cachedMetricsMu   sync.RWMutex
 	cachedMetrics     *pb.MetricsResponse
@@ -72,12 +76,25 @@ type ParticipantPool struct {
 	metricsCacheTTL   time.Duration
 }
 
+type WebRTCParticipant interface {
+	GetID() uint32
+	CreateOffer() (string, error)
+	SetRemoteAnswer(sdpAnswer string) error
+	AddICECandidate(candidate string) error
+	Start()
+	Stop()
+	Close() error
+	GetPeerConnection() any
+	NeedsRecreation() (bool, string)
+}
+
 func NewParticipantPool(testID string) *ParticipantPool {
 	pp := &ParticipantPool{
-		participants:    make(map[uint32]*VirtualParticipant),
-		testID:          testID,
-		targetHost:      "127.0.0.1", // Default to localhost
-		metricsCacheTTL: 500 * time.Millisecond,
+		participants:       make(map[uint32]*VirtualParticipant),
+		webrtcParticipants: make(map[uint32]WebRTCParticipant),
+		testID:             testID,
+		targetHost:         "127.0.0.1", // Default to localhost
+		metricsCacheTTL:    500 * time.Millisecond,
 	}
 	// background metrics aggregator
 	go pp.runMetricsAggregator()
@@ -187,6 +204,35 @@ func (pp *ParticipantPool) GetParticipant(id uint32) *VirtualParticipant {
 	return pp.participants[id]
 }
 
+// Adding WebRTC participant to the pool, If the test is already running, it will start the participant immediately
+func (pp *ParticipantPool) AddWebRTCParticipant(id uint32, participant WebRTCParticipant) {
+	pp.webrtcParticipantsMu.Lock()
+	pp.webrtcParticipants[id] = participant
+	isRunning := pp.running.Load()
+	pp.webrtcParticipantsMu.Unlock()
+
+	log.Printf("[Pool] Added WebRTC participant %d (test running: %v)", id, isRunning)
+
+	// If test is already running, start the participant immediately
+	if isRunning {
+		participant.Start()
+		log.Printf("[Pool] Started WebRTC participant %d (test was already running)", id)
+	}
+}
+
+func (pp *ParticipantPool) GetWebRTCParticipant(id uint32) WebRTCParticipant {
+	pp.webrtcParticipantsMu.RLock()
+	defer pp.webrtcParticipantsMu.RUnlock()
+	return pp.webrtcParticipants[id]
+}
+
+func (pp *ParticipantPool) RemoveWebRTCParticipant(id uint32) {
+	pp.webrtcParticipantsMu.Lock()
+	defer pp.webrtcParticipantsMu.Unlock()
+	delete(pp.webrtcParticipants, id)
+	log.Printf("[Pool] Removed WebRTC participant %d", id)
+}
+
 func (pp *ParticipantPool) GetAllParticipants() []*VirtualParticipant {
 	pp.mu.RLock()
 	defer pp.mu.RUnlock()
@@ -202,27 +248,80 @@ func (pp *ParticipantPool) Start() {
 	pp.startTime = time.Now()
 	pp.running.Store(true)
 
+	// Start participants concurrently to avoid blocking
 	pp.mu.RLock()
-	defer pp.mu.RUnlock()
-
+	participantCount := len(pp.participants)
+	participants := make([]*VirtualParticipant, 0, participantCount)
 	for _, p := range pp.participants {
-		p.Start()
+		participants = append(participants, p)
+	}
+	pp.mu.RUnlock()
+
+	// Start UDP participants in batches to avoid overwhelming the system
+	// Use smaller batch size and longer delays to prevent OOM kills
+	// For 150 participants per pod, this takes ~1.5 seconds to start all
+	batchSize := 25
+	batchDelay := 50 * time.Millisecond
+
+	// For large participant counts, use even smaller batches
+	if participantCount > 100 {
+		batchSize = 20
+		batchDelay = 75 * time.Millisecond
+	}
+	if participantCount > 200 {
+		batchSize = 15
+		batchDelay = 100 * time.Millisecond
 	}
 
-	log.Printf("[Pool] Started %d participants", len(pp.participants))
+	log.Printf("[Pool] Starting %d UDP participants in batches of %d", participantCount, batchSize)
+
+	for i := 0; i < len(participants); i += batchSize {
+		end := min(i+batchSize, len(participants))
+		batch := participants[i:end]
+		for _, p := range batch {
+			p.Start()
+		}
+		// Delay between batches to prevent resource spikes and OOM kills
+		if end < len(participants) {
+			time.Sleep(batchDelay)
+		}
+	}
+
+	// Start WebRTC participants concurrently
+	pp.webrtcParticipantsMu.Lock()
+	webrtcParticipants := make([]WebRTCParticipant, 0, len(pp.webrtcParticipants))
+	for _, wp := range pp.webrtcParticipants {
+		webrtcParticipants = append(webrtcParticipants, wp)
+	}
+
+	webrtcCount := len(webrtcParticipants)
+	pp.webrtcParticipantsMu.Unlock()
+	for _, wp := range webrtcParticipants {
+		wp.Start()
+	}
+
+	log.Printf("[Pool] Started %d UDP participants and %d WebRTC participants", participantCount, webrtcCount)
 }
 
 func (pp *ParticipantPool) Stop() {
 	pp.running.Store(false)
 
 	pp.mu.RLock()
-	defer pp.mu.RUnlock()
-
 	for _, p := range pp.participants {
 		p.Stop()
 	}
+	udpCount := len(pp.participants)
+	pp.mu.RUnlock()
 
-	log.Printf("[Pool] Stopped all participants")
+	// Stop WebRTC participants
+	pp.webrtcParticipantsMu.Lock()
+	for _, wp := range pp.webrtcParticipants {
+		wp.Stop()
+	}
+	webrtcCount := len(pp.webrtcParticipants)
+	pp.webrtcParticipantsMu.Unlock()
+
+	log.Printf("[Pool] Stopped %d UDP participants and %d WebRTC participants", udpCount, webrtcCount)
 }
 
 // Background worker to update cached metrics
@@ -256,42 +355,22 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 		totalPackets += p.packetsSent.Load()
 		totalBitrate += int64(p.VideoConfig.BitrateKbps)
 
-		// Quick jitter/loss access - minimize lock time
-		p.activeSpikesMu.RLock()
-		spikeCount := len(p.activeSpikes)
-		hasJitterSpike := false
-		jitterValue := 0.0
-		for _, spike := range p.activeSpikes {
-			if spike.Type == "network_jitter" {
-				hasJitterSpike = true
-				if jitterStr, ok := spike.Params["jitter_std_dev_ms"]; ok {
-					var jitterMs int
-					fmt.Sscanf(jitterStr, "%d", &jitterMs)
-					jitterValue += float64(jitterMs) / 2.0
-				}
-			}
-		}
-		p.activeSpikesMu.RUnlock()
-
-		// Simplified MOS calculation based on spike count
-		if spikeCount > 0 {
-			totalMos += 3.5 // Degraded
-			totalLoss += 5.0
-			if hasJitterSpike {
-				totalJitter += jitterValue
-			} else {
-				totalJitter += 10.0
-			}
-		} else {
-			totalMos += 4.45   // Excellent
-			totalJitter += 1.0 // Minimal baseline jitter
-		}
+		pm := p.GetMetrics()
+		totalMos += pm.MosScore
+		totalLoss += pm.PacketLossPercent
+		totalJitter += pm.JitterMs
 	}
 	pp.mu.RUnlock()
 
 	count := float64(participantCount)
 	if count == 0 {
 		count = 1
+	}
+
+	// Cap packet loss at 100% (is already be capped in GetPacketLoss, but I'm insecure)
+	avgLoss := totalLoss / count
+	if avgLoss > 100.0 {
+		avgLoss = 100.0
 	}
 
 	elapsed := int64(0)
@@ -330,7 +409,7 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 			TotalFramesSent:  totalFrames,
 			TotalPacketsSent: totalPackets,
 			AvgJitterMs:      totalJitter / count,
-			AvgPacketLoss:    totalLoss / count,
+			AvgPacketLoss:    avgLoss,
 			AvgMosScore:      totalMos / count,
 			TotalBitrateKbps: totalBitrate,
 		},
@@ -373,27 +452,36 @@ func (pp *ParticipantPool) GetMetrics() *pb.MetricsResponse {
 	return pp.cachedMetrics
 }
 
-// Injects a spike for specific participants
+// Injects a spike for specific participants(concurrently)
 func (pp *ParticipantPool) InjectSpike(spike *pb.SpikeEvent) error {
+	// Get target IDs first (quick read lock)
 	pp.mu.RLock()
-	defer pp.mu.RUnlock()
-
 	targetIDs := spike.ParticipantIds
 	if len(targetIDs) == 0 {
-		// Apply to all participants
+		// Apply to all participants - collect IDs
+		targetIDs = make([]uint32, 0, len(pp.participants))
 		for id := range pp.participants {
 			targetIDs = append(targetIDs, id)
 		}
 	}
 
+	// Collect participant references while holding lock
+	participants := make([]*VirtualParticipant, 0, len(targetIDs))
 	for _, id := range targetIDs {
 		if p, ok := pp.participants[id]; ok {
-			p.AddSpike(spike)
+			participants = append(participants, p)
 		}
+	}
+	pp.mu.RUnlock()
+
+	// Apply spike to participants without holding pool lock
+	// This allows concurrent WebRTC operations
+	for _, p := range participants {
+		p.AddSpike(spike)
 	}
 
 	log.Printf("[Pool] Injected spike %s type=%s to %d participants",
-		spike.SpikeId, spike.Type, len(targetIDs))
+		spike.SpikeId, spike.Type, len(participants))
 
 	return nil
 }
@@ -448,31 +536,31 @@ func (p *VirtualParticipant) runFrameLoop() {
 		p.timestamp += uint32(90000 / fps)
 
 		for _, pkt := range packets {
-			// Apply packet loss spike if active
+			// Serialize RTP packet first (needed for size calculation)
+			data := pkt.Marshal()
+
+			// Always count packet as sent (even if we drop it due to spike)
+			p.packetsSent.Add(1)
+			p.bytesSent.Add(int64(len(data)))
+			p.metrics.RecordPacketSent(len(data))
+
+			// Apply packet loss spike if active (after counting as sent)
 			if p.shouldDropPacket() {
 				p.metrics.RecordPacketLost()
-				continue
+				continue // Don't actually send the packet
 			}
-
-			// Serialize RTP packet
-			data := pkt.Marshal()
 
 			// Send real UDP packet if enabled
 			if p.udpEnabled && p.udpConn != nil && p.targetAddr != nil {
-				n, err := p.udpConn.WriteToUDP(data, p.targetAddr)
+				_, err := p.udpConn.WriteToUDP(data, p.targetAddr)
 				if err != nil {
+					// Network error - count as lost (already counted as sent above)
 					p.metrics.RecordPacketLost()
 					continue
 				}
-				p.packetsSent.Add(1)
-				p.bytesSent.Add(int64(n))
-				p.metrics.RecordPacketSent(n)
-			} else {
-				// Fallback: just update metrics without actual transmission
-				p.packetsSent.Add(1)
-				p.bytesSent.Add(int64(len(data)))
-				p.metrics.RecordPacketSent(len(data))
+				// Packet sent successfully (already counted above)
 			}
+			// If UDP not enabled, packet is simulated (already counted above)
 		}
 	}
 }
