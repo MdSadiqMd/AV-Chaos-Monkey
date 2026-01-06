@@ -276,7 +276,12 @@ func (m *RTPMetrics) GetPacketLoss() float64 {
 	if sent == 0 {
 		return 0
 	}
-	return float64(lost) / float64(sent) * 100.0
+	lossPercent := float64(lost) / float64(sent) * 100.0
+	// Cap at 100% - packet loss cannot exceed 100%
+	if lossPercent > 100.0 {
+		lossPercent = 100.0
+	}
+	return lossPercent
 }
 
 func (m *RTPMetrics) GetRTT() time.Duration {

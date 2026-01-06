@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -113,17 +115,51 @@ func NewParticipant(id uint32, config VideoConfig) (*VirtualParticipant, error) 
 	// Enable non-standard extensions for testing
 	settingEngine.SetSRTPReplayProtectionWindow(512)
 
+	// Configure ICE timeouts for faster connection establishment
+	// Reduced timeouts to fail faster if TURN is not available
+	settingEngine.SetICETimeouts(5*time.Second, 15*time.Second, 3*time.Second)
+
+	// Note: For Kubernetes deployments, the server generates ICE candidates with pod IPs
+	// (e.g., 10.244.0.x) which the client cannot reach directly. This requires:
+	// 1. A TURN server for NAT traversal (recommended for production) - configured below
+	// 2. TURN servers must be accessible from within the Kubernetes cluster
+	// 3. Without TURN, WebRTC connections will fail in Kubernetes environments
+
 	api := pionwebrtc.NewAPI(
 		pionwebrtc.WithMediaEngine(m),
 		pionwebrtc.WithSettingEngine(settingEngine),
 	)
 
 	// Create peer connection config with real ICE servers
+	// Note: For Kubernetes deployments, TURN servers are essential for NAT traversal
+	// The STUN servers help with discovery, but TURN is needed for relay when both peers are behind NAT
+	// Get TURN server from environment or use default
+	turnHost := os.Getenv("TURN_HOST")
+	if turnHost == "" {
+		turnHost = "coturn"
+	}
+	turnUsername := os.Getenv("TURN_USERNAME")
+	if turnUsername == "" {
+		turnUsername = "webrtc"
+	}
+	turnPassword := os.Getenv("TURN_PASSWORD")
+	if turnPassword == "" {
+		turnPassword = "webrtc123"
+	}
+
 	pcConfig := pionwebrtc.Configuration{
 		ICEServers: []pionwebrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 			{URLs: []string{"stun:stun1.l.google.com:19302"}},
+			// Local TURN server (coturn in docker-compose or Kubernetes)
+			{URLs: []string{fmt.Sprintf("turn:%s:3478", turnHost)}, Username: turnUsername, Credential: turnPassword},
+			{URLs: []string{fmt.Sprintf("turn:%s:3478?transport=tcp", turnHost)}, Username: turnUsername, Credential: turnPassword},
+			// Fallback to public TURN servers if local server is not available
+			{URLs: []string{"turn:openrelay.metered.ca:80"}, Username: "openrelayproject", Credential: "openrelayproject"},
+			{URLs: []string{"turn:openrelay.metered.ca:443"}, Username: "openrelayproject", Credential: "openrelayproject"},
 		},
+		// Use ICETransportPolicyAll to try all candidates (host, srflx, relay)
+		// If TURN is not accessible, connection will fail (expected in Kubernetes without proper TURN)
 		ICETransportPolicy: pionwebrtc.ICETransportPolicyAll,
 		BundlePolicy:       pionwebrtc.BundlePolicyMaxBundle,
 		RTCPMuxPolicy:      pionwebrtc.RTCPMuxPolicyRequire,
@@ -141,6 +177,26 @@ func NewParticipant(id uint32, config VideoConfig) (*VirtualParticipant, error) 
 	})
 	pc.OnICEConnectionStateChange(func(state pionwebrtc.ICEConnectionState) {
 		log.Printf("[WebRTC] Participant %d ICE state: %s", id, state.String())
+		if state == pionwebrtc.ICEConnectionStateFailed {
+			log.Printf("[WebRTC] Participant %d: ICE connection failed. This may be due to NAT traversal issues.", id)
+		}
+	})
+
+	pc.OnICECandidate(func(candidate *pionwebrtc.ICECandidate) {
+		if candidate != nil {
+			candidateType := candidate.Typ.String()
+			log.Printf("[WebRTC] Participant %d: Generated ICE candidate [%s]: %s", id, candidateType, candidate.String())
+			switch candidate.Typ {
+			case pionwebrtc.ICECandidateTypeRelay:
+				log.Printf("[WebRTC] Participant %d: ✅ TURN relay candidate generated! This is required for Kubernetes NAT traversal.", id)
+			case pionwebrtc.ICECandidateTypeHost:
+				log.Printf("[WebRTC] Participant %d: ⚠️  Host candidate (pod IP) - client may not be able to reach this", id)
+			case pionwebrtc.ICECandidateTypeSrflx:
+				log.Printf("[WebRTC] Participant %d: ℹ️  Server reflexive candidate (via STUN) - may work if NAT allows", id)
+			}
+		} else {
+			log.Printf("[WebRTC] Participant %d: ICE candidate gathering complete", id)
+		}
 	})
 
 	// Create video track with H.264
@@ -427,25 +483,89 @@ func (p *VirtualParticipant) GetID() uint32 {
 }
 
 // GetPeerConnection returns the underlying peer connection
-func (p *VirtualParticipant) GetPeerConnection() *pionwebrtc.PeerConnection {
+func (p *VirtualParticipant) GetPeerConnection() any {
 	return p.peerConn
 }
 
-// Creates an SDP offer
+// NeedsRecreation checks if the participant needs to be recreated for a new connection
+// Returns true if:
+// 1. Connection is in failed/closed/disconnected state
+// 2. Connection already has a remote description (client reconnecting)
+func (p *VirtualParticipant) NeedsRecreation() (bool, string) {
+	if p.peerConn == nil {
+		return true, "peer connection is nil"
+	}
+
+	state := p.peerConn.ConnectionState()
+	if state == pionwebrtc.PeerConnectionStateFailed ||
+		state == pionwebrtc.PeerConnectionStateClosed ||
+		state == pionwebrtc.PeerConnectionStateDisconnected {
+		return true, fmt.Sprintf("connection state is %s", state.String())
+	}
+
+	// If remote description is already set, the client is reconnecting
+	// We need to recreate the participant to allow a fresh connection
+	if p.peerConn.CurrentRemoteDescription() != nil {
+		return true, "remote description already set (client reconnecting)"
+	}
+
+	return false, ""
+}
+
+// Creates an SDP offer (non-blocking, returns immediately with trickle ICE)
 func (p *VirtualParticipant) CreateOffer() (string, error) {
+	// Check if we already have a local description (offer was already created)
+	if p.peerConn.LocalDescription() != nil {
+		// Return existing offer
+		return p.peerConn.LocalDescription().SDP, nil
+	}
+
 	offer, err := p.peerConn.CreateOffer(nil)
 	if err != nil {
 		return "", err
 	}
 
-	// Gather ICE candidates
-	gatherComplete := pionwebrtc.GatheringCompletePromise(p.peerConn)
+	// Set local description to start ICE gathering (non-blocking)
+	// ICE candidates will be gathered in the background and can be added via trickle ICE
 	if err := p.peerConn.SetLocalDescription(offer); err != nil {
 		return "", err
 	}
-	<-gatherComplete
 
-	return p.peerConn.LocalDescription().SDP, nil
+	// Return SDP immediately without waiting for ICE gathering
+	// This allows the HTTP request to complete quickly
+	// ICE candidates will be gathered asynchronously and can be sent via /ice endpoint
+	sdp := p.peerConn.LocalDescription().SDP
+
+	go func() {
+		gatherComplete := pionwebrtc.GatheringCompletePromise(p.peerConn)
+		select {
+		case <-gatherComplete:
+			// Check if we got any relay candidates
+			sdp := p.peerConn.LocalDescription().SDP
+			hasRelay := strings.Contains(sdp, "typ relay")
+			hasHost := strings.Contains(sdp, "typ host")
+			hasSrflx := strings.Contains(sdp, "typ srflx")
+
+			if hasRelay {
+				log.Printf("[WebRTC] Participant %d: ✅ ICE gathering complete - SDP contains TURN relay candidates", p.id)
+			} else {
+				log.Printf("[WebRTC] Participant %d: ⚠️  ICE gathering complete - No TURN relay candidates", p.id)
+				log.Printf("[WebRTC] Participant %d:   - Host candidates: %v", p.id, hasHost)
+				log.Printf("[WebRTC] Participant %d:   - Srflx candidates: %v", p.id, hasSrflx)
+				log.Printf("[WebRTC] Participant %d:   - Relay candidates: %v (REQUIRED for Kubernetes)", p.id, hasRelay)
+			}
+		case <-time.After(10 * time.Second):
+			sdp := p.peerConn.LocalDescription().SDP
+			hasRelay := strings.Contains(sdp, "typ relay")
+			log.Printf("[WebRTC] Participant %d: ⚠️  ICE gathering timeout (10s)", p.id)
+			if !hasRelay {
+				log.Printf("[WebRTC] Participant %d: ⚠️  No relay candidates - TURN servers may be unreachable", p.id)
+			}
+		}
+	}()
+
+	log.Printf("[WebRTC] Participant %d: SDP offer created (ICE gathering in background)", p.id)
+	return sdp, nil
 }
 
 // Sets the remote SDP answer
