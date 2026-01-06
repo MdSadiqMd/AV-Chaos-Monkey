@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: udp-receiver
+  labels:
+    app: udp-receiver
+spec:
+  containers:
+    - name: udp-receiver
+      image: python:3.11-slim
+      command:
+        - python3
+        - -c
+        - |
+          import socket
+          import struct
+          import sys
+          from datetime import datetime
+
+          def parse_rtp_header(data):
+              if len(data) < 12:
+                  return None
+              version = (data[0] >> 6) & 0x03
+              extension = (data[0] >> 4) & 0x01
+              csrc_count = data[0] & 0x0F
+              payload_type = data[1] & 0x7F
+              sequence = struct.unpack('>H', data[2:4])[0]
+              timestamp = struct.unpack('>I', data[4:8])[0]
+              ssrc = struct.unpack('>I', data[8:12])[0]
+              offset = 12 + csrc_count * 4
+              participant_id = 0
+              if extension and len(data) >= offset + 8:
+                  ext_id = struct.unpack('>H', data[offset:offset+2])[0]
+                  ext_len = struct.unpack('>H', data[offset+2:offset+4])[0] * 4
+                  if ext_id == 1 and ext_len == 4:
+                      participant_id = struct.unpack('<I', data[offset+4:offset+8])[0]
+                  offset += 4 + ext_len
+              return {'participant_id': participant_id, 'payload_type': payload_type, 'sequence': sequence, 'payload_size': len(data) - offset}
+
+          sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          sock.bind(('0.0.0.0', 5000))
+          print(f"[{datetime.now().isoformat()}] UDP receiver listening on 0.0.0.0:5000", flush=True)
+
+          packet_count = 0
+          participants = set()
+          try:
+              while True:
+                  data, addr = sock.recvfrom(4096)
+                  packet_count += 1
+                  header = parse_rtp_header(data)
+                  if header:
+                      participants.add(header['participant_id'])
+                  if packet_count <= 10 or packet_count % 1000 == 0:
+                      print(f"[{datetime.now().isoformat()}] Packet #{packet_count} | Participants: {len(participants)} | From: {addr}", flush=True)
+          except KeyboardInterrupt:
+              print(f"[{datetime.now().isoformat()}] Total: {packet_count} packets from {len(participants)} participants", flush=True)
+      ports:
+        - containerPort: 5000
+          protocol: UDP
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "100m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-receiver
+  labels:
+    app: udp-receiver
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5000
+      targetPort: 5000
+      protocol: UDP
+      name: udp
+  selector:
+    app: udp-receiver
