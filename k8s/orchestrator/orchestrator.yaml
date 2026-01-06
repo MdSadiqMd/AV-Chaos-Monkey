@@ -20,6 +20,65 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
+      volumes:
+        - name: host-ip
+          emptyDir: {}
+      # hostNetwork causes port conflicts when multiple pods try to bind to :8080
+      # For WebRTC, using TURN servers and service-based access instead
+      initContainers:
+        - name: detect-host-ip
+          image: busybox:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Try to detect host IP using methods
+              # macOS: ipconfig getifaddr en0
+              # Linux: hostname -I | awk '{print $1}' or ifconfig
+
+              # Method 1: Try to get from node IP (Kubernetes)
+              if [ -n "$NODE_IP" ] && [ "$NODE_IP" != "127.0.0.1" ]; then
+                echo "$NODE_IP" > /shared/host-ip
+                echo "Detected host IP from NODE_IP: $NODE_IP"
+                exit 0
+              fi
+
+              # Method 2: Try Linux method (hostname -I)
+              if command -v hostname >/dev/null 2>&1; then
+                HOST_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "")
+                if [ -n "$HOST_IP" ] && [ "$HOST_IP" != "127.0.0.1" ]; then
+                  echo "$HOST_IP" > /shared/host-ip
+                  echo "Detected host IP from hostname -I: $HOST_IP"
+                  exit 0
+                fi
+              fi
+
+              # Method 3: Try ifconfig (Linux/macOS)
+              if command -v ifconfig >/dev/null 2>&1; then
+                HOST_IP=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | sed 's/addr://' 2>/dev/null || echo "")
+                if [ -n "$HOST_IP" ]; then
+                  echo "$HOST_IP" > /shared/host-ip
+                  echo "Detected host IP from ifconfig: $HOST_IP"
+                  exit 0
+                fi
+              fi
+
+              # Fallback: Use node IP or default to 127.0.0.1
+              if [ -n "$NODE_IP" ]; then
+                echo "$NODE_IP" > /shared/host-ip
+                echo "Using NODE_IP as fallback: $NODE_IP"
+              else
+                echo "127.0.0.1" > /shared/host-ip
+                echo "Using default 127.0.0.1 (no IP detection method worked)"
+              fi
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          volumeMounts:
+            - name: host-ip
+              mountPath: /shared
       containers:
         - name: orchestrator
           image: chaos-monkey-orchestrator:latest
@@ -36,6 +95,20 @@ spec:
                   fieldPath: metadata.name
             - name: TOTAL_PARTITIONS
               value: "10"
+            - name: UDP_TARGET_HOST
+              value: "udp-relay" # UDP-to-TCP relay for kubectl port-forward
+            - name: UDP_TARGET_PORT
+              value: "5000" # Port where UDP relay listens
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: TURN_HOST
+              value: "coturn" # TURN server service name in Kubernetes
+            - name: TURN_USERNAME
+              value: "webrtc"
+            - name: TURN_PASSWORD
+              value: "webrtc123"
           resources:
             requests:
               cpu: "1"
@@ -60,12 +133,36 @@ spec:
             - -c
             - |
               set -e
+              # Check if UDP_TARGET_HOST is explicitly set to a real IP (not empty or 127.0.0.1)
+              # If so, use it directly without auto-detection
+              if [ -n "$UDP_TARGET_HOST" ] && [ "$UDP_TARGET_HOST" != "127.0.0.1" ] && [ "$UDP_TARGET_HOST" != "" ]; then
+                echo "Using explicit UDP_TARGET_HOST from env: $UDP_TARGET_HOST" >&2
+              elif [ -f /shared/host-ip ]; then
+                # Read host IP from init container
+                export UDP_TARGET_HOST=$(cat /shared/host-ip)
+                echo "Using detected UDP_TARGET_HOST from init: $UDP_TARGET_HOST" >&2
+              else
+                # Fallback: try to detect at runtime
+                if command -v hostname >/dev/null 2>&1; then
+                  export UDP_TARGET_HOST=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "127.0.0.1")
+                elif command -v ifconfig >/dev/null 2>&1; then
+                  export UDP_TARGET_HOST=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | sed 's/addr://' 2>/dev/null || echo "127.0.0.1")
+                else
+                  export UDP_TARGET_HOST="${NODE_IP:-127.0.0.1}"
+                fi
+                echo "Detected UDP_TARGET_HOST at runtime: $UDP_TARGET_HOST" >&2
+              fi
+
               PARTITION_ID=$(echo "$POD_NAME" | sed 's/.*-//')
               if [ -z "$PARTITION_ID" ] || ! echo "$PARTITION_ID" | grep -qE '^[0-9]+$'; then
                 PARTITION_ID=0
               fi
               echo "Starting orchestrator partition $PARTITION_ID of $TOTAL_PARTITIONS" >&2
-              exec env PARTITION_ID="$PARTITION_ID" /usr/bin/dumb-init -- /usr/local/bin/orchestrator -http :8080
+              exec env PARTITION_ID="$PARTITION_ID" UDP_TARGET_HOST="$UDP_TARGET_HOST" /usr/bin/dumb-init -- /usr/local/bin/orchestrator -http :8080
+          volumeMounts:
+            - name: host-ip
+              mountPath: /shared
+              readOnly: true
 ---
 apiVersion: v1
 kind: Service
