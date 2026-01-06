@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	customMiddleware "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/middleware"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pool"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/spike"
+	webrtc "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/webrtc"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -20,6 +22,7 @@ import (
 type HTTPServer struct {
 	addr            string
 	tests           map[string]*TestSession
+	testsMu         sync.RWMutex // Protect tests map from concurrent access
 	spikeInject     *spike.Injector
 	partitionID     int // Which partition this instance handles (0-indexed)
 	totalPartitions int // Total number of partitions (pods)
@@ -100,6 +103,7 @@ func (s *HTTPServer) Start() error {
 			r.Post("/spike", s.handleInjectSpike)
 			r.Get("/sdp/{participantID}", s.handleGetSDP)
 			r.Post("/answer/{participantID}", s.handleSetAnswer)
+			r.Post("/ice/{participantID}", s.handleAddICECandidate)
 		})
 	})
 
@@ -213,7 +217,9 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 		ScheduledSpikes: req.Spikes,
 	}
 
+	s.testsMu.Lock()
 	s.tests[req.TestId] = session
+	s.testsMu.Unlock()
 
 	resp := &pb.CreateTestResponse{
 		TestId:           req.TestId,
@@ -234,7 +240,10 @@ func (s *HTTPServer) getTestSession(r *http.Request) (*TestSession, error) {
 		return nil, fmt.Errorf("test ID required")
 	}
 
+	s.testsMu.RLock()
 	session, exists := s.tests[testID]
+	s.testsMu.RUnlock()
+
 	if !exists {
 		return nil, fmt.Errorf("test not found")
 	}
@@ -253,21 +262,42 @@ func (s *HTTPServer) handleStartTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session.Pool.Start()
+	// Get participant count quickly (this is just a map read, should be fast)
+	participantCount := session.Pool.Size()
+
+	// Set state and time immediately (before any blocking operations)
 	session.State = "running"
 	session.StartTime = time.Now()
+
+	// Prepare response BEFORE starting participants (to minimize blocking)
+	resp := &pb.StartTestResponse{
+		Started:         true,
+		StartTimeUnixMs: session.StartTime.UnixMilli(),
+		StatusMessage:   fmt.Sprintf("Starting %d participants", participantCount),
+	}
+
+	// Write response headers immediately
+	w.Header().Set("Content-Type", "application/json")
+
+	// Start the pool in background goroutine to avoid blocking HTTP response
+	// This prevents "signal: killed" errors when starting many participants and concurrently starting the reciever tests
+	go func() {
+		session.Pool.Start()
+		log.Printf("[HTTP] Test %s: Started %d participants in background", session.ID, participantCount)
+	}()
+
+	// Schedule spikes in background
 	for _, spike := range session.ScheduledSpikes {
 		go s.scheduleSpike(session, spike)
 	}
 
-	resp := &pb.StartTestResponse{
-		Started:         true,
-		StartTimeUnixMs: session.StartTime.UnixMilli(),
-		StatusMessage:   fmt.Sprintf("Started %d participants", session.Pool.Size()),
+	// Encode and write response (this should be fast)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("[HTTP] Error encoding response for test %s: %v", session.ID, err)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	log.Printf("[HTTP] Test %s start request completed (participants starting in background)", session.ID)
 }
 
 func (s *HTTPServer) scheduleSpike(session *TestSession, spikeEvent *pb.SpikeEvent) {
@@ -498,15 +528,18 @@ func (s *HTTPServer) handleInjectSpike(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session.Pool.InjectSpike(&spikeEvent)
-	if err := s.spikeInject.Inject(&spikeEvent); err != nil {
-		// Log but don't fail btw
-		log.Printf("[Spike] Warning: %v", err)
-	}
+	// Inject spike in background goroutine to avoid blocking HTTP response
+	// This allows WebRTC connections to be established concurrently
+	go func() {
+		session.Pool.InjectSpike(&spikeEvent)
+		if err := s.spikeInject.Inject(&spikeEvent); err != nil {
+			log.Printf("[Spike] Warning: %v", err)
+		}
+	}()
 
 	resp := &pb.InjectSpikeResponse{
 		Injected: true,
-		Message:  fmt.Sprintf("Spike %s injected for %d seconds", spikeEvent.SpikeId, spikeEvent.DurationSeconds),
+		Message:  fmt.Sprintf("Spike %s queued for %d seconds", spikeEvent.SpikeId, spikeEvent.DurationSeconds),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -520,6 +553,12 @@ func (s *HTTPServer) handleGetSDP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Lock session to prevent race conditions with test start/stop - simple check -> if test is stopped, reject the request
+	if session.State == "stopped" {
+		http.Error(w, "Test is stopped, cannot create WebRTC connection", http.StatusBadRequest)
+		return
+	}
+
 	participantIDStr := chi.URLParam(r, "participantID")
 	if participantIDStr == "" {
 		http.Error(w, "Participant ID required", http.StatusBadRequest)
@@ -533,32 +572,160 @@ func (s *HTTPServer) handleGetSDP(w http.ResponseWriter, r *http.Request) {
 	}
 	participantID := uint32(participantIDInt)
 
-	p := session.Pool.GetParticipant(participantID)
-	if p == nil {
-		http.Error(w, "Participant not found", http.StatusNotFound)
+	// Check if WebRTC participant already exists
+	webrtcParticipant := session.Pool.GetWebRTCParticipant(participantID)
+
+	// Check if existing participant needs to be recreated:
+	// 1. Connection is in failed/closed/disconnected state
+	// 2. Connection already has a remote description (client reconnecting)
+	if webrtcParticipant != nil {
+		shouldRecreate, recreateReason := webrtcParticipant.NeedsRecreation()
+
+		if shouldRecreate {
+			log.Printf("[HTTP] WebRTC participant %d: %s, recreating...", participantID, recreateReason)
+			// Close old connection and remove from pool
+			webrtcParticipant.Close()
+			session.Pool.RemoveWebRTCParticipant(participantID)
+			webrtcParticipant = nil
+		}
+	}
+
+	if webrtcParticipant == nil {
+		// Get the UDP participant to get video/audio config
+		udpParticipant := session.Pool.GetParticipant(participantID)
+		if udpParticipant == nil {
+			http.Error(w, "Participant not found", http.StatusNotFound)
+			return
+		}
+
+		// Create WebRTC participant with real peer connection
+		videoConfig := webrtc.VideoConfig{
+			Width:       int(udpParticipant.VideoConfig.Width),
+			Height:      int(udpParticipant.VideoConfig.Height),
+			FPS:         int(udpParticipant.VideoConfig.Fps),
+			BitrateKbps: int(udpParticipant.VideoConfig.BitrateKbps),
+			Codec:       "H264",
+		}
+
+		newWebRTCParticipant, err := webrtc.NewParticipant(participantID, videoConfig)
+		if err != nil {
+			log.Printf("[HTTP] Failed to create WebRTC participant %d: %v", participantID, err)
+			http.Error(w, fmt.Sprintf("Failed to create WebRTC participant: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Add to pool (this will start it if test is already running)
+		session.Pool.AddWebRTCParticipant(participantID, newWebRTCParticipant)
+		webrtcParticipant = newWebRTCParticipant
+		log.Printf("[HTTP] Created WebRTC participant %d with real peer connection (test state: %s)", participantID, session.State)
+	}
+
+	// Generate real SDP offer from WebRTC peer connection
+	// It's non-blocking -> returns immediately with trickle ICE support
+	sdpOffer, err := webrtcParticipant.CreateOffer()
+	if err != nil {
+		log.Printf("[HTTP] Failed to create SDP offer for participant %d: %v", participantID, err)
+		http.Error(w, fmt.Sprintf("Failed to create SDP offer: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	sdp := generateSDPOffer(p)
 	resp := map[string]any{
 		"participant_id": participantID,
-		"sdp_offer":      sdp,
-		"ice_credentials": map[string]string{
-			"ufrag":    p.IceUfrag,
-			"password": p.IcePassword,
-		},
-		"srtp_keys": map[string]string{
-			"master_key":  fmt.Sprintf("%x", p.SrtpMasterKey),
-			"master_salt": fmt.Sprintf("%x", p.SrtpMasterSalt),
-		},
+		"sdp_offer":      sdpOffer,
+		"test_state":     session.State,
+		"trickle_ice":    true, // Indicate that trickle ICE is supported
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+	log.Printf("[HTTP] SDP offer returned for participant %d (test state: %s)", participantID, session.State)
+}
+
+// Sets the SDP answer for a participant
+func (s *HTTPServer) handleSetAnswer(w http.ResponseWriter, r *http.Request) {
+	session, err := s.getTestSession(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Don't block WebRTC connections if test is stopped - allow connections to be established
+	// The test state doesn't prevent WebRTC connections, only UDP participants are affected
+	participantIDStr := chi.URLParam(r, "participantID")
+	if participantIDStr == "" {
+		http.Error(w, "Participant ID required", http.StatusBadRequest)
+		return
+	}
+
+	participantIDInt, err := strconv.Atoi(participantIDStr)
+	if err != nil {
+		http.Error(w, "Invalid participant ID", http.StatusBadRequest)
+		return
+	}
+	participantID := uint32(participantIDInt)
+
+	webrtcParticipant := session.Pool.GetWebRTCParticipant(participantID)
+	if webrtcParticipant == nil {
+		http.Error(w, "WebRTC participant not found. Call /sdp first to create the participant.", http.StatusNotFound)
+		return
+	}
+
+	var req struct {
+		SDPAnswer string `json:"sdp_answer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := webrtcParticipant.SetRemoteAnswer(req.SDPAnswer); err != nil {
+		log.Printf("[HTTP] Failed to set SDP answer for participant %d: %v", participantID, err)
+		http.Error(w, fmt.Sprintf("Failed to set SDP answer: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// If test is running and WebRTC participant wasn't started yet, start it now
+	// This handles the case where participant was created before test started
+	if session.State == "running" {
+		// Check if participant needs to be started (it should have been started by AddWebRTCParticipant,
+		// but double-check in case of race conditions)
+		// Note: We can't easily check if it's already started, so we rely on AddWebRTCParticipant
+		// to have started it. But we ensure it's in the pool's WebRTC participants list
+		log.Printf("[HTTP] SDP answer set for participant %d (test is running)", participantID)
+	}
+
+	log.Printf("[HTTP] WebRTC participant %d: SDP answer set, connection establishing...", participantID)
+
+	// Get connection state from peer connection
+	pc := webrtcParticipant.GetPeerConnection()
+	var iceState, connectionState string
+	if pc != nil {
+		// Type assert to get connection states
+		type connectionStateGetter interface {
+			ICEConnectionState() interface{ String() string }
+			ConnectionState() interface{ String() string }
+		}
+		if csg, ok := pc.(connectionStateGetter); ok {
+			iceState = csg.ICEConnectionState().String()
+			connectionState = csg.ConnectionState().String()
+		} else {
+			iceState = "unknown"
+			connectionState = "unknown"
+		}
+	}
+
+	resp := map[string]any{
+		"connected":        true,
+		"ice_state":        iceState,
+		"connection_state": connectionState,
+		"message":          "SDP answer accepted, WebRTC connection establishing",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Sets the SDP answer for a participant
-func (s *HTTPServer) handleSetAnswer(w http.ResponseWriter, r *http.Request) {
+func (s *HTTPServer) handleAddICECandidate(w http.ResponseWriter, r *http.Request) {
 	session, err := s.getTestSession(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -578,25 +745,39 @@ func (s *HTTPServer) handleSetAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	participantID := uint32(participantIDInt)
 
-	p := session.Pool.GetParticipant(participantID)
-	if p == nil {
-		http.Error(w, "Participant not found", http.StatusNotFound)
+	webrtcParticipant := session.Pool.GetWebRTCParticipant(participantID)
+	if webrtcParticipant == nil {
+		http.Error(w, "WebRTC participant not found. Call /sdp first to create the participant.", http.StatusNotFound)
 		return
 	}
 
 	var req struct {
-		SDPAnswer string `json:"sdp_answer"`
+		Candidate     string `json:"candidate"`
+		SDPMLineIndex *int   `json:"sdpMLineIndex,omitempty"`
+		SDPMid        string `json:"sdpMid,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
+	if req.Candidate == "" {
+		http.Error(w, "Candidate is required", http.StatusBadRequest)
+		return
+	}
+
+	// Add ICE candidate to peer connection (non-blocking)
+	if err := webrtcParticipant.AddICECandidate(req.Candidate); err != nil {
+		log.Printf("[HTTP] Failed to add ICE candidate for participant %d: %v", participantID, err)
+		http.Error(w, fmt.Sprintf("Failed to add ICE candidate: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HTTP] WebRTC participant %d: Added ICE candidate from client", participantID)
+
 	resp := map[string]any{
-		"connected":  true,
-		"ice_state":  "connected",
-		"dtls_state": "connected",
-		"srtp_state": "active",
+		"added":   true,
+		"message": "ICE candidate added successfully",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -627,63 +808,4 @@ func (s *HTTPServer) handleGetTest(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) GetTest(testID string) *TestSession {
 	return s.tests[testID]
-}
-
-// Generates an SDP offer for a participant
-func generateSDPOffer(p *pool.VirtualParticipant) string {
-	return fmt.Sprintf(`v=0
-o=simulator %d 2 IN IP4 127.0.0.1
-s=MeetingBotUDPSimulator
-t=0 0
-a=group:BUNDLE 0 1
-a=extmap-allow-mixed
-a=msid-semantic: WMS stream_%d
-
-m=video %d RTP/AVP 96
-c=IN IP4 127.0.0.1
-a=rtcp:%d IN IP4 127.0.0.1
-a=ice-ufrag:%s
-a=ice-pwd:%s
-a=ice-options:trickle
-a=fingerprint:sha-256 FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF
-a=setup:actpass
-a=mid:0
-a=extmap:1 urn:ietf:params:rtp-hdrext:abs-send-time
-a=extmap:2 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
-a=rtpmap:96 H264/90000
-a=rtcp-fb:96 goog-remb
-a=rtcp-fb:96 transport-cc
-a=rtcp-fb:96 nack
-a=rtcp-fb:96 nack pli
-a=fmtp:96 profile-level-id=42e01f;packetization-mode=1
-a=rtcp-mux
-a=ssrc:%d participant_id=%d
-a=ssrc:%d cname:participant_%d
-
-m=audio %d RTP/AVP 111
-c=IN IP4 127.0.0.1
-a=rtcp:%d IN IP4 127.0.0.1
-a=ice-ufrag:%s
-a=ice-pwd:%s
-a=mid:1
-a=rtpmap:111 opus/48000/2
-a=rtcp-fb:111 transport-cc
-a=fmtp:111 useinbandfec=1
-a=rtcp-mux
-a=ssrc:%d participant_id=%d
-`,
-		p.ID*1000,
-		p.ID,
-		p.BackendRTPPort,
-		p.BackendRTPPort,
-		p.IceUfrag,
-		p.IcePassword,
-		p.ID*1000, p.ID,
-		p.ID*1000, p.ID,
-		p.BackendRTPPort+1,
-		p.BackendRTPPort+1,
-		p.IceUfrag,
-		p.IcePassword,
-		p.ID*1000+1, p.ID,
-	)
 }
