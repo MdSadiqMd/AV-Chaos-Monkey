@@ -1,0 +1,162 @@
+# UDP-to-TCP Relay for Kind clusters
+# Receives UDP packets from orchestrator pods and streams them over TCP
+# These TCP streams will be forwarded to a local machine using kubectl port-forward to get TCP to local machine, then convert back to UDP
+#
+# Architecture:
+#   Orchestrator pods -> udp-relay:5000 (UDP) -> TCP stream on :5001
+#   kubectl port-forward udp-relay 15001:5001
+#   Local relay: TCP 15001 -> UDP localhost:5002 -> Your application
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: udp-relay
+  labels:
+    app: udp-relay
+spec:
+  hostNetwork: true # Using host's network as can send UDP to host.docker.internal
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+    - name: udp-relay
+      image: python:3.11-slim
+      command:
+        - python3
+        - -c
+        - |
+          import socket
+          import threading
+          import time
+          from datetime import datetime
+
+          UDP_PORT = 5000
+          TCP_PORT = 5001
+
+          # Track connected TCP clients
+          tcp_clients = []
+          tcp_clients_lock = threading.Lock()
+
+          # Stats
+          udp_packets = 0
+          tcp_forwards = 0
+
+          def log(msg):
+              print(f"[{datetime.now().isoformat()}] {msg}", flush=True)
+
+          def tcp_server():
+              """Accept TCP connections from kubectl port-forward"""
+              server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              server.bind(('0.0.0.0', TCP_PORT))
+              server.listen(5)
+              log(f"TCP server listening on :{TCP_PORT}")
+
+              while True:
+                  try:
+                      client, addr = server.accept()
+                      log(f"TCP client connected: {addr}")
+                      with tcp_clients_lock:
+                          tcp_clients.append(client)
+                  except Exception as e:
+                      log(f"TCP accept error: {e}")
+
+          def udp_receiver():
+              """Receive UDP packets and forward to all TCP clients"""
+              global udp_packets, tcp_forwards
+
+              sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              sock.bind(('0.0.0.0', UDP_PORT))
+              log(f"UDP receiver listening on :{UDP_PORT}")
+
+              while True:
+                  try:
+                      data, addr = sock.recvfrom(4096)
+                      udp_packets += 1
+
+                      # Log first few packets and then periodically
+                      if udp_packets <= 5 or udp_packets % 1000 == 0:
+                          log(f"UDP packet #{udp_packets} from {addr}, {len(data)} bytes")
+
+                      # Forward to all TCP clients
+                      # Prepend 2-byte length header for framing
+                      length = len(data)
+                      framed = length.to_bytes(2, 'big') + data
+
+                      with tcp_clients_lock:
+                          dead_clients = []
+                          for client in tcp_clients:
+                              try:
+                                  client.sendall(framed)
+                                  tcp_forwards += 1
+                              except Exception as e:
+                                  log(f"TCP send error, removing client: {e}")
+                                  dead_clients.append(client)
+
+                          for client in dead_clients:
+                              tcp_clients.remove(client)
+                              try:
+                                  client.close()
+                              except:
+                                  pass
+                  except Exception as e:
+                      log(f"UDP receive error: {e}")
+
+          def stats_printer():
+              """Print stats periodically"""
+              global udp_packets, tcp_forwards
+              while True:
+                  time.sleep(10)
+                  with tcp_clients_lock:
+                      client_count = len(tcp_clients)
+                  log(f"Stats: UDP recv={udp_packets}, TCP fwd={tcp_forwards}, clients={client_count}")
+
+          log("UDP-to-TCP Relay starting...")
+          log(f"UDP listen: :{UDP_PORT}")
+          log(f"TCP listen: :{TCP_PORT}")
+          log("")
+          log("To receive packets on your Mac:")
+          log("  1. kubectl port-forward udp-relay 15001:5001")
+          log("  2. go run ./tools/udp-relay/main.go -tcp-port 15001 -udp-target localhost:5002")
+          log("  3. go run ./examples/go/udp_receiver.go 5002")
+          log("")
+
+          # Start threads
+          threading.Thread(target=tcp_server, daemon=True).start()
+          threading.Thread(target=stats_printer, daemon=True).start()
+
+          # Run UDP receiver in main thread
+          udp_receiver()
+      ports:
+        - containerPort: 5000
+          protocol: UDP
+          name: udp-in
+        - containerPort: 5001
+          protocol: TCP
+          name: tcp-out
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "100m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-relay
+  labels:
+    app: udp-relay
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5000
+      targetPort: 5000
+      protocol: UDP
+      name: udp
+    - port: 5001
+      targetPort: 5001
+      protocol: TCP
+      name: tcp
+  selector:
+    app: udp-relay
