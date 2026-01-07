@@ -58,6 +58,11 @@ type SpikeEvent struct {
 	Params          map[string]any `json:"params"`
 }
 
+// Global cached pod list - populated at startup, reused for all spike injections
+var cachedPodNames []string
+var cachedKubectlCmd string
+var consecutiveFailures int // Track consecutive spike failures for cache refresh
+
 func main() {
 	config := parseFlags()
 
@@ -74,6 +79,9 @@ func main() {
 		os.Exit(1)
 	}
 	logSuccess("API server is healthy")
+
+	// Initialize pod cache for spike injection
+	initPodCache()
 
 	// Create test
 	logInfo("Creating test with %d participants...", config.NumParticipants)
@@ -99,10 +107,15 @@ func main() {
 	startTime := time.Now()
 	endTime := startTime.Add(time.Duration(config.TestDurationSeconds) * time.Second)
 	spikeCount := 0
-	nextSpikeTime := startTime.Add(time.Duration(config.SpikeIntervalSeconds) * time.Second)
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	// Use separate ticker for metrics display (every 2 seconds)
+	metricsTicker := time.NewTicker(2 * time.Second)
+	defer metricsTicker.Stop()
+
+	// Use separate ticker for spike injection (at exact intervals)
+	// This ensures spikes are evenly spaced regardless of system load
+	spikeTicker := time.NewTicker(time.Duration(config.SpikeIntervalSeconds) * time.Second)
+	defer spikeTicker.Stop()
 
 	for {
 		select {
@@ -111,7 +124,13 @@ func main() {
 			logWarning("Received signal - will cleanup when test completes naturally")
 			stopTest(client, config.TestID)
 			return
-		case <-ticker.C:
+		case <-spikeTicker.C:
+			if spikeCount < config.NumSpikes && time.Now().Before(endTime) {
+				spikeCount++
+				logChaos("Injecting spike %d/%d...", spikeCount, config.NumSpikes)
+				injectRandomSpike(client, config, spikeCount)
+			}
+		case <-metricsTicker.C:
 			currentTime := time.Now()
 			if currentTime.After(endTime) {
 				fmt.Println()
@@ -124,14 +143,6 @@ func main() {
 				fmt.Printf("Total spikes injected: %d\n", spikeCount)
 				fmt.Printf("Test ID: %s\n", config.TestID)
 				return
-			}
-
-			// Inject spike if it's time
-			if currentTime.After(nextSpikeTime) && spikeCount < config.NumSpikes {
-				spikeCount++
-				logChaos("Injecting spike %d/%d...", spikeCount, config.NumSpikes)
-				injectRandomSpike(client, config, spikeCount)
-				nextSpikeTime = currentTime.Add(time.Duration(config.SpikeIntervalSeconds) * time.Second)
 			}
 
 			// Display metrics with progress bar
@@ -273,21 +284,58 @@ func startTest(client *utils.HTTPClient, testID string) error {
 			}
 
 			// Send request to all pods using kubectl exec
+			// Add delay between pods to prevent OOM kills from simultaneous startup
 			var lastErr error
 			successCount := 0
-			for _, podName := range podNames {
+			failedPods := []string{}
+			for i, podName := range podNames {
 				curlCmd := fmt.Sprintf("curl -s -X POST http://localhost:8080/api/v1/test/%s/start -H 'Content-Type: application/json'", testID)
 				cmd := exec.Command(kubectlCmd, "exec", podName, "--", "sh", "-c", curlCmd)
 				output, err := cmd.Output()
 				if err != nil {
-					lastErr = err
-					logWarning("Failed to start test on pod %s: %v", podName, err)
-				} else {
-					successCount++
-					if string(output) != "" && !strings.Contains(string(output), "started") && !strings.Contains(string(output), "true") {
-						logWarning("Pod %s returned unexpected response: %s", podName, string(output))
+					// Retry once after a short delay
+					time.Sleep(500 * time.Millisecond)
+					cmd = exec.Command(kubectlCmd, "exec", podName, "--", "sh", "-c", curlCmd)
+					output, err = cmd.Output()
+					if err != nil {
+						// Check if test is actually running despite the error
+						verifyCmd := fmt.Sprintf("curl -s http://localhost:8080/api/v1/test/%s", testID)
+						verifyExec := exec.Command(kubectlCmd, "exec", podName, "--", "sh", "-c", verifyCmd)
+						verifyOutput, verifyErr := verifyExec.Output()
+						if verifyErr == nil && strings.Contains(string(verifyOutput), "\"state\":\"running\"") {
+							successCount++
+							continue
+						}
+						lastErr = err
+						failedPods = append(failedPods, podName)
+						logWarning("Pod %s: verification also failed: %v (original error: %v)", podName, verifyErr, err)
+						logWarning("Failed to start test on pod %s: %v", podName, err)
+						continue
 					}
 				}
+
+				if string(output) != "" && !strings.Contains(string(output), "started") && !strings.Contains(string(output), "true") {
+					verifyCmd := fmt.Sprintf("curl -s http://localhost:8080/api/v1/test/%s", testID)
+					verifyExec := exec.Command(kubectlCmd, "exec", podName, "--", "sh", "-c", verifyCmd)
+					verifyOutput, _ := verifyExec.Output()
+					if !strings.Contains(string(verifyOutput), "\"state\":\"running\"") {
+						logWarning("Pod %s: test not running after error %v (response: %s)", podName, err, string(verifyOutput))
+						failedPods = append(failedPods, podName)
+						continue
+					}
+				}
+
+				successCount++
+
+				// Add delay between pods to prevent OOM kills
+				// This gives each pod time to start its participants before the next one starts
+				if i < len(podNames)-1 {
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+
+			if len(failedPods) > 0 {
+				logWarning("Failed to start test on %d pod(s): %v", len(failedPods), failedPods)
 			}
 
 			if successCount > 0 {
@@ -306,25 +354,153 @@ func startTest(client *utils.HTTPClient, testID string) error {
 }
 
 func stopTest(client *utils.HTTPClient, testID string) {
+	// Broadcast stop to all orchestrator pods using kubectl exec
+	kubectlCmd, err := utils.FindCommand("kubectl")
+	if err == nil {
+		cmd := exec.Command(kubectlCmd, "get", "pods", "-l", "app=orchestrator", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+		output, err := cmd.Output()
+		if err == nil {
+			podNames := []string{}
+			for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					podNames = append(podNames, line)
+				}
+			}
+
+			successCount := 0
+			for _, podName := range podNames {
+				curlCmd := fmt.Sprintf("curl -s -X POST http://localhost:8080/api/v1/test/%s/stop -H 'Content-Type: application/json'", testID)
+				cmd := exec.Command(kubectlCmd, "exec", podName, "--", "sh", "-c", curlCmd)
+				if _, err := cmd.Output(); err == nil {
+					successCount++
+				}
+			}
+			if successCount > 0 {
+				logInfo("Stopped test on %d/%d pods", successCount, len(podNames))
+				return
+			}
+		}
+	}
+	// Fallback to single pod
 	client.Post(fmt.Sprintf("/api/v1/test/%s/stop", testID), nil)
 }
 
-func injectRandomSpike(client *utils.HTTPClient, config *Config, spikeNum int) {
+func injectRandomSpike(_ *utils.HTTPClient, config *Config, spikeNum int) {
 	spikeID := fmt.Sprintf("chaos_spike_%d_%d", spikeNum, time.Now().Unix())
 	duration := rand.Intn(6) + 2 // 2-8 seconds
 	participants := selectParticipants(config.NumParticipants)
 
-	spikeType := rand.Intn(5)
-	switch spikeType {
-	case 0, 1: // Packet loss (30%)
-		injectPacketLossSpike(client, config.TestID, spikeID, participants, duration)
-	case 2: // Jitter (25%)
-		injectJitterSpike(client, config.TestID, spikeID, participants, duration)
-	case 3: // Frame drop (20%)
-		injectFrameDropSpike(client, config.TestID, spikeID, participants, duration)
-	case 4: // Bitrate reduce (15%)
-		injectBitrateReduceSpike(client, config.TestID, spikeID, participants, duration)
+	// Use weighted random selection for better distribution
+	// Packet loss: 40%, Jitter: 20%, Frame drop: 20%, Bitrate reduce: 20%
+	spikeType := rand.Intn(100)
+	switch {
+	case spikeType < 40: // Packet loss (40%)
+		injectPacketLossSpike(config.TestID, spikeID, participants, duration)
+	case spikeType < 60: // Jitter (20%)
+		injectJitterSpike(config.TestID, spikeID, participants, duration)
+	case spikeType < 80: // Frame drop (20%)
+		injectFrameDropSpike(config.TestID, spikeID, participants, duration)
+	default: // Bitrate reduce (20%)
+		injectBitrateReduceSpike(config.TestID, spikeID, participants, duration)
 	}
+}
+
+// Sending a spike to a single orchestrator pod, this spike will be applied to participants on that pod
+func broadcastSpike(testID string, spike SpikeEvent) {
+	if len(cachedPodNames) == 0 || cachedKubectlCmd == "" {
+		logWarning("Pod cache not initialized, spike may not reach pods")
+		return
+	}
+
+	spikeJSON, err := json.Marshal(spike)
+	if err != nil {
+		logWarning("Failed to marshal spike: %v", err)
+		return
+	}
+
+	podName := cachedPodNames[rand.Intn(len(cachedPodNames))]
+
+	curlCmd := fmt.Sprintf("curl -s --max-time 3 -X POST http://localhost:8080/api/v1/test/%s/spike -H 'Content-Type: application/json' -d @-", testID)
+	cmd := exec.Command(cachedKubectlCmd, "exec", "-i", podName, "--", "sh", "-c", curlCmd)
+	cmd.Stdin = strings.NewReader(string(spikeJSON))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := cmd.Output()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			consecutiveFailures++
+			if consecutiveFailures >= 5 {
+				logWarning("Multiple spike failures - kubectl may be overloaded")
+				consecutiveFailures = 0
+			}
+		} else {
+			consecutiveFailures = 0
+		}
+	case <-time.After(4 * time.Second):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		consecutiveFailures++
+	}
+}
+
+// Initialize cached pod list at startup
+func initPodCache() {
+	kubectlCmd, err := utils.FindCommand("kubectl")
+	if err != nil {
+		logWarning("kubectl not found, spike injection will be limited")
+		return
+	}
+	cachedKubectlCmd = kubectlCmd
+
+	cmd := exec.Command(kubectlCmd, "get", "pods", "-l", "app=orchestrator", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	output, err := cmd.Output()
+	if err != nil {
+		logWarning("Failed to get pod list: %v", err)
+		return
+	}
+
+	cachedPodNames = []string{}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			cachedPodNames = append(cachedPodNames, line)
+		}
+	}
+
+	if len(cachedPodNames) > 0 {
+		logInfo("Cached %d orchestrator pods for spike injection", len(cachedPodNames))
+	} else {
+		logWarning("No orchestrator pods found")
+	}
+}
+
+var lastPortForwardAttempt time.Time
+var portForwardCooldown = 30 * time.Second // Don't spam restart attempts
+
+// Checking if port-forward is alive and restarts if needed
+func checkAndRestartPortForward(baseURL string) bool {
+	client := utils.NewHTTPClient(baseURL)
+	if err := client.HealthCheck(); err == nil {
+		return true // Port-forward is working
+	}
+
+	// Check cooldown - don't spam restart attempts
+	if time.Since(lastPortForwardAttempt) < portForwardCooldown {
+		return false // Still in cooldown, skip restart attempt
+	}
+	lastPortForwardAttempt = time.Now()
+
+	// Don't try to restart port-forward - it causes issues
+	// Just return false and let the caller use kubectl exec fallback
+	logWarning("Port-forward is down - using kubectl exec fallback")
+	return false
 }
 
 func selectParticipants(total int) []int {
@@ -345,7 +521,7 @@ func selectParticipants(total int) []int {
 	return []int{}
 }
 
-func injectPacketLossSpike(client *utils.HTTPClient, testID, spikeID string, participants []int, duration int) {
+func injectPacketLossSpike(testID, spikeID string, participants []int, duration int) {
 	lossPercent := rand.Intn(25) + 1
 	pattern := "random"
 	if rand.Intn(2) == 1 {
@@ -363,11 +539,11 @@ func injectPacketLossSpike(client *utils.HTTPClient, testID, spikeID string, par
 		},
 	}
 
-	client.Post(fmt.Sprintf("/api/v1/test/%s/spike", testID), spike)
+	broadcastSpike(testID, spike)
 	logChaos("Injected packet loss spike: %d%% loss, pattern=%s", lossPercent, pattern)
 }
 
-func injectJitterSpike(client *utils.HTTPClient, testID, spikeID string, participants []int, duration int) {
+func injectJitterSpike(testID, spikeID string, participants []int, duration int) {
 	baseLatency := rand.Intn(40) + 10
 	jitter := rand.Intn(180) + 20
 
@@ -382,11 +558,11 @@ func injectJitterSpike(client *utils.HTTPClient, testID, spikeID string, partici
 		},
 	}
 
-	client.Post(fmt.Sprintf("/api/v1/test/%s/spike", testID), spike)
+	broadcastSpike(testID, spike)
 	logChaos("Injected jitter spike: base=%dms, jitter=%dms", baseLatency, jitter)
 }
 
-func injectFrameDropSpike(client *utils.HTTPClient, testID, spikeID string, participants []int, duration int) {
+func injectFrameDropSpike(testID, spikeID string, participants []int, duration int) {
 	dropPercent := rand.Intn(50) + 10
 
 	spike := SpikeEvent{
@@ -399,11 +575,11 @@ func injectFrameDropSpike(client *utils.HTTPClient, testID, spikeID string, part
 		},
 	}
 
-	client.Post(fmt.Sprintf("/api/v1/test/%s/spike", testID), spike)
+	broadcastSpike(testID, spike)
 	logChaos("Injected frame drop spike: %d%% frames dropped", dropPercent)
 }
 
-func injectBitrateReduceSpike(client *utils.HTTPClient, testID, spikeID string, participants []int, duration int) {
+func injectBitrateReduceSpike(testID, spikeID string, participants []int, duration int) {
 	reductionPercent := rand.Intn(50) + 30
 	newBitrate := 2500 * (100 - reductionPercent) / 100
 	transition := rand.Intn(5) + 1
@@ -419,13 +595,35 @@ func injectBitrateReduceSpike(client *utils.HTTPClient, testID, spikeID string, 
 		},
 	}
 
-	client.Post(fmt.Sprintf("/api/v1/test/%s/spike", testID), spike)
+	broadcastSpike(testID, spike)
 	logChaos("Injected bitrate reduction spike: %dkbps (%d%% reduction)", newBitrate, reductionPercent)
 }
 
 func displayMetrics(client *utils.HTTPClient, testID string, elapsed time.Duration, startTime, endTime time.Time, spikeCount, numSpikes, numParticipants int) {
-	data, err := client.Get(fmt.Sprintf("/api/v1/test/%s/metrics", testID))
-	if err != nil {
+	var data []byte
+	var err error
+
+	// Use kubectl exec as PRIMARY method - more reliable than port-forward under load
+	if len(cachedPodNames) > 0 && cachedKubectlCmd != "" {
+		// Pick a random pod to distribute load
+		podName := cachedPodNames[rand.Intn(len(cachedPodNames))]
+		curlCmd := fmt.Sprintf("curl -s --max-time 2 http://localhost:8080/api/v1/test/%s/metrics", testID)
+		execCmd := exec.Command(cachedKubectlCmd, "exec", podName, "--", "sh", "-c", curlCmd)
+		data, err = execCmd.Output()
+	}
+
+	// Fallback to port-forward if kubectl exec failed
+	if err != nil || len(data) == 0 {
+		data, err = client.Get(fmt.Sprintf("/api/v1/test/%s/metrics", testID))
+
+		// If port-forward fails, try to restart it (with cooldown)
+		if err != nil {
+			checkAndRestartPortForward(client.BaseURL)
+			// Don't retry immediately - just skip this metrics update
+		}
+	}
+
+	if err != nil || len(data) == 0 {
 		return
 	}
 
@@ -455,27 +653,19 @@ func displayMetrics(client *utils.HTTPClient, testID string, elapsed time.Durati
 	avgLoss := getFloat64(aggregate, "avg_packet_loss")
 
 	remaining := max(int(time.Until(endTime).Seconds()), 0)
-	fmt.Print("\033[2K\r")
-
-	showProgress(int(elapsed.Seconds()), int(endTime.Sub(startTime).Seconds()))
-	fmt.Printf(" | Remaining: %ds | Spikes: %d/%d", remaining, spikeCount, numSpikes)
 
 	state := "running"
 	if s, ok := metrics["state"].(string); ok {
 		state = s
 	}
 
+	showProgress(int(elapsed.Seconds()), int(endTime.Sub(startTime).Seconds()))
+	fmt.Printf(" | Remaining: %ds | Spikes: %d/%d", remaining, spikeCount, numSpikes)
 	fmt.Println()
-	logMetrics("State: %s%s%s | Elapsed: %ds | Participants: %d",
-		utils.BOLD, state, utils.NC, int(elapsed.Seconds()), numParticipants)
-	logMetrics("Frames: %s%d%s | Packets: %s%d%s | Bitrate: %s%.0fkbps%s",
-		utils.BOLD, totalFrames, utils.NC,
-		utils.BOLD, totalPackets, utils.NC,
-		utils.BOLD, getFloat64(aggregate, "total_bitrate_kbps"), utils.NC)
-	logMetrics("Avg Jitter: %s%.2fms%s | Avg Loss: %s%.2f%%%s | Avg MOS: %s%.2f%s",
-		utils.BOLD, avgJitter, utils.NC,
-		utils.BOLD, avgLoss*100, utils.NC,
-		utils.BOLD, getFloat64(aggregate, "avg_mos_score"), utils.NC)
+	logMetrics("State=%s | Elapsed=%ds | Participants=%d | Frames=%d | Packets=%d",
+		state, int(elapsed.Seconds()), numParticipants, totalFrames, totalPackets)
+	logMetrics("Bitrate=%.0fkbps | Jitter=%.2fms | Loss=%.2f%% | MOS=%.2f",
+		getFloat64(aggregate, "total_bitrate_kbps"), avgJitter, avgLoss*100, getFloat64(aggregate, "avg_mos_score"))
 }
 
 func showProgress(current, total int) {
@@ -498,24 +688,28 @@ func showProgress(current, total int) {
 		utils.BOLD, percentage, utils.NC)
 }
 
+func timestamp() string {
+	return time.Now().Format("2006-01-02T15:04:05.000")
+}
+
 func logInfo(format string, args ...any) {
-	fmt.Printf("%s[INFO]%s %s\n", utils.BLUE, utils.NC, fmt.Sprintf(format, args...))
+	fmt.Printf("%s[%s][INFO]%s %s\n", utils.BLUE, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }
 
 func logSuccess(format string, args ...any) {
-	fmt.Printf("%s[✓]%s %s\n", utils.GREEN, utils.NC, fmt.Sprintf(format, args...))
+	fmt.Printf("%s[%s][✓]%s %s\n", utils.GREEN, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }
 
 func logWarning(format string, args ...any) {
-	fmt.Printf("%s[⚠]%s %s\n", utils.YELLOW, utils.NC, fmt.Sprintf(format, args...))
+	fmt.Printf("%s[%s][⚠]%s %s\n", utils.YELLOW, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }
 
 func logError(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "%s[✗]%s %s\n", utils.RED, utils.NC, fmt.Sprintf(format, args...))
+	fmt.Fprintf(os.Stderr, "%s[%s][✗]%s %s\n", utils.RED, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }
 
 func logChaos(format string, args ...any) {
-	fmt.Printf("%s[CHAOS]%s %s\n", utils.MAGENTA, utils.NC, fmt.Sprintf(format, args...))
+	fmt.Printf("%s[%s][CHAOS]%s %s\n", utils.MAGENTA, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }
 
 func updateTargetFilesWithTestID(testID string) {
@@ -590,5 +784,5 @@ func getProjectRoot() string {
 }
 
 func logMetrics(format string, args ...any) {
-	fmt.Printf("%s[METRICS]%s %s\n", utils.CYAN, utils.NC, fmt.Sprintf(format, args...))
+	fmt.Printf("%s[%s][METRICS]%s %s\n", utils.CYAN, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }
