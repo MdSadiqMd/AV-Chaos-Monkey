@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -11,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"text/template"
 	"time"
@@ -28,6 +32,8 @@ func main() {
 		skipTest        = flag.Bool("skip-test", false, "Skip running the test")
 		setup           = flag.Bool("setup", false, "Setup Kubernetes cluster")
 		clusterName     = flag.String("name", defaultClusterName, "Kubernetes cluster name")
+		udpTargetHost   = flag.String("udp-target-host", "", "UDP target host (empty = in-cluster udp-receiver)")
+		udpTargetPort   = flag.Int("udp-target-port", 5000, "UDP target port")
 	)
 	flag.Parse()
 
@@ -70,15 +76,21 @@ func main() {
 	}
 
 	projectRoot := getProjectRoot()
-	if err := runK8sDeployment(projectRoot, *replicas, *numParticipants, *skipTest); err != nil {
+	if err := runK8sDeployment(projectRoot, *replicas, *numParticipants, *skipTest, *udpTargetHost, *udpTargetPort); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, skipTest bool) error {
+func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, skipTest bool, udpTargetHost string, udpTargetPort int) error {
 	if err := checkPrerequisites(); err != nil {
 		return err
+	}
+
+	// Default to UDP relay which converts UDP to TCP for kubectl port-forward
+	if udpTargetHost == "" {
+		udpTargetHost = "udp-relay"
+		logInfo("Using UDP relay (UDP -> TCP -> localhost:5002)")
 	}
 
 	systemMem, _ := utils.DetectSystemMemory()
@@ -125,6 +137,9 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 	if err := updateReplicas(projectRoot, replicas); err != nil {
 		return err
 	}
+	if err := updateUDPTarget(projectRoot, udpTargetHost, udpTargetPort); err != nil {
+		return err
+	}
 	if err := deployK8s(projectRoot); err != nil {
 		return err
 	}
@@ -144,9 +159,12 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 	setupPortForwarding()
 
 	if !skipTest {
+		testID := fmt.Sprintf("chaos_test_%d", time.Now().Unix())
+
 		os.Setenv("NUM_PARTICIPANTS", strconv.Itoa(participants))
 		os.Setenv("TEST_DURATION_SECONDS", "600")
 		os.Setenv("BASE_URL", "http://localhost:8080")
+		os.Setenv("TEST_ID", testID)
 
 		chaosTestPath := filepath.Join(projectRoot, "tools", "chaos-test", "main.go")
 		cmd := exec.Command("go", "run", chaosTestPath)
@@ -252,6 +270,43 @@ func updateReplicas(projectRoot string, replicas int) error {
 	return nil
 }
 
+func updateUDPTarget(projectRoot string, udpTargetHost string, udpTargetPort int) error {
+	k8sDir := filepath.Join(projectRoot, "k8s", "orchestrator")
+	orchestratorYAML := filepath.Join(k8sDir, "orchestrator.yaml")
+
+	// Read the original YAML file
+	content, err := os.ReadFile(orchestratorYAML)
+	if err != nil {
+		return fmt.Errorf("failed to read orchestrator.yaml: %w", err)
+	}
+
+	contentStr := string(content)
+
+	// Update UDP_TARGET_HOST
+	// Match: value: ""  # Set to your external host IP (e.g., "192.168.1.100")
+	// or: value: "some-host"
+	udpHostPattern := `(name: UDP_TARGET_HOST\s+value: )"[^"]*"(\s*#.*)?`
+	udpHostReplacement := fmt.Sprintf("${1}\"%s\"${2}", udpTargetHost)
+	re := regexp.MustCompile(udpHostPattern)
+	contentStr = re.ReplaceAllString(contentStr, udpHostReplacement)
+
+	// Update UDP_TARGET_PORT
+	// Match: value: ""  # Set to your external port (e.g., "6000")
+	// or: value: "5000"
+	udpPortPattern := `(name: UDP_TARGET_PORT\s+value: )"[^"]*"(\s*#.*)?`
+	udpPortReplacement := fmt.Sprintf("${1}\"%d\"${2}", udpTargetPort)
+	re = regexp.MustCompile(udpPortPattern)
+	contentStr = re.ReplaceAllString(contentStr, udpPortReplacement)
+
+	// Write back to file
+	if err := os.WriteFile(orchestratorYAML, []byte(contentStr), 0644); err != nil {
+		return fmt.Errorf("failed to write orchestrator.yaml: %w", err)
+	}
+
+	logInfo("Updated UDP target: %s:%d", udpTargetHost, udpTargetPort)
+	return nil
+}
+
 func deployK8s(projectRoot string) error {
 	logInfo("Deploying to Kubernetes...")
 
@@ -280,6 +335,27 @@ func deployK8s(projectRoot string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Run()
+
+	// Apply coturn TURN server (needed for WebRTC)
+	logInfo("Applying coturn TURN server...")
+	cmd = exec.Command(kubectlCmd, "apply", "-f", filepath.Join(k8sDir, "coturn", "coturn.yaml"))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Run()
+
+	// Apply UDP relay (converts UDP to TCP for kubectl port-forward)
+	logInfo("Applying UDP relay...")
+	udpRelayPath := filepath.Join(k8sDir, "udp-relay", "udp-relay.yaml")
+	if _, err := os.Stat(udpRelayPath); err == nil {
+		// Delete existing pod if it exists (pods are immutable)
+		exec.Command(kubectlCmd, "delete", "pod", "udp-relay", "--ignore-not-found=true").Run()
+		time.Sleep(2 * time.Second)
+
+		cmd = exec.Command(kubectlCmd, "apply", "-f", udpRelayPath)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Run()
+	}
 
 	// Apply orchestrator
 	logInfo("Applying orchestrator StatefulSet...")
@@ -555,8 +631,8 @@ spec:
 func setupPortForwarding() {
 	logInfo("Setting up port forwarding...")
 
-	// Kill existing port-forwards
 	exec.Command("pkill", "-9", "-f", "kubectl port-forward").Run()
+	exec.Command("pkill", "-9", "-f", "udp-relay-binary").Run()
 	time.Sleep(2 * time.Second)
 
 	kubectlCmd, _ := utils.FindCommand("kubectl")
@@ -578,10 +654,128 @@ func setupPortForwarding() {
 		time.Sleep(1 * time.Second)
 	}
 
+	// Start UDP relay chain: port-forward TCP from udp-relay pod, then local relay to UDP
+	setupUDPRelayChain(kubectlCmd)
+
 	logSuccess("Port forwarding active")
 	fmt.Printf("  Orchestrator: %shttp://localhost:8080%s\n", utils.CYAN, utils.NC)
 	fmt.Printf("  Prometheus:   %shttp://localhost:9091%s\n", utils.CYAN, utils.NC)
 	fmt.Printf("  Grafana:      %shttp://localhost:3000%s (admin/admin)\n", utils.CYAN, utils.NC)
+	fmt.Printf("  UDP Receiver: %sUDP localhost:5002%s (run: go run ./examples/go/udp_receiver.go 5002)\n", utils.CYAN, utils.NC)
+}
+
+// Starts the UDP relay chain to forward packets to localhost:5002
+func setupUDPRelayChain(kubectlCmd string) {
+	logInfo("Setting up UDP relay chain...")
+
+	// Wait for udp-relay pod to be ready
+	waitCmd := exec.Command(kubectlCmd, "wait", "--for=condition=ready", "pod/udp-relay", "--timeout=30s")
+	if err := waitCmd.Run(); err != nil {
+		logWarning("UDP relay pod not ready, skipping UDP relay chain: %v", err)
+		return
+	}
+
+	// Start port-forward for UDP relay TCP port (15001 -> udp-relay:5001)
+	pfCmd := exec.Command(kubectlCmd, "port-forward", "pod/udp-relay", "15001:5001")
+	if err := pfCmd.Start(); err != nil {
+		logWarning("Failed to start UDP relay port-forward: %v", err)
+		return
+	}
+	time.Sleep(2 * time.Second)
+
+	// Start local TCP-to-UDP relay as embedded goroutine
+	go runLocalUDPRelay()
+
+	logSuccess("UDP relay chain active (Kubernetes -> localhost:5002)")
+}
+
+// Connecting to TCP port 15001 and forwards packets to UDP localhost:5002
+// This runs as a background goroutine and auto-reconnects on disconnect
+func runLocalUDPRelay() {
+	const tcpAddr = "localhost:15001"
+	const udpTarget = "localhost:5002"
+
+	udpAddr, err := net.ResolveUDPAddr("udp", udpTarget)
+	if err != nil {
+		logWarning("UDP relay: failed to resolve UDP target: %v", err)
+		return
+	}
+
+	// Create UDP socket bound to ephemeral port (not 5002!) for sending
+	localAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		logWarning("UDP relay: failed to resolve local address: %v", err)
+		return
+	}
+	udpConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		logWarning("UDP relay: failed to create UDP socket: %v", err)
+		return
+	}
+	defer udpConn.Close()
+
+	var packetCount int64
+	var lastLogTime time.Time
+
+	// Reconnect loop
+	for {
+		err := relayTCPToUDP(tcpAddr, udpConn, udpAddr, &packetCount, &lastLogTime)
+		if err != nil {
+			if time.Since(lastLogTime) > 30*time.Second {
+				logInfo("UDP relay: reconnecting... (%v)", err)
+				lastLogTime = time.Now()
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// Connecting to TCP and forwards length-prefixed packets to UDP
+func relayTCPToUDP(tcpAddr string, udpConn *net.UDPConn, udpAddr *net.UDPAddr, packetCount *int64, lastLogTime *time.Time) error {
+	conn, err := net.DialTimeout("tcp", tcpAddr, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	logInfo("UDP relay: connected to TCP %s, forwarding to UDP", tcpAddr)
+
+	// Read length-prefixed packets (2-byte big-endian length + payload)
+	lenBuf := make([]byte, 2)
+	dataBuf := make([]byte, 65536)
+
+	for {
+		// Read length header
+		_, err := io.ReadFull(conn, lenBuf)
+		if err != nil {
+			return err
+		}
+
+		length := binary.BigEndian.Uint16(lenBuf)
+		if length == 0 {
+			continue
+		}
+
+		// Read payload
+		_, err = io.ReadFull(conn, dataBuf[:length])
+		if err != nil {
+			return err
+		}
+
+		// Forward to UDP using WriteToUDP (works even if receiver started after us)
+		_, err = udpConn.WriteToUDP(dataBuf[:length], udpAddr)
+		if err != nil {
+			continue
+		}
+
+		count := atomic.AddInt64(packetCount, 1)
+
+		// Log progress periodically
+		if count == 1 || count%10000 == 0 {
+			// logInfo("UDP relay: forwarded %d packets to localhost:5002", count)
+			*lastLogTime = time.Now()
+		}
+	}
 }
 
 func cleanupResources() {
