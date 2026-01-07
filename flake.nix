@@ -151,12 +151,12 @@
               # Create wrapper scripts in bin
               cat > $out/bin/start-k8s <<EOF
               #!${pkgs.bash}/bin/bash
-              exec $out/share/av-chaos-monkey/scripts/start_k8s.sh "\$@"
+              exec $out/share/av-chaos-monkey/scripts/start_everything.sh k8s "\$@"
               EOF
 
-              cat > $out/bin/chaos-test <<EOF
+              cat > $out/bin/cleanup <<EOF
               #!${pkgs.bash}/bin/bash
-              exec $out/share/av-chaos-monkey/scripts/chaos_test.sh "\$@"
+              exec $out/share/av-chaos-monkey/scripts/cleanup.sh "\$@"
               EOF
 
               cat > $out/bin/start-everything <<EOF
@@ -165,7 +165,7 @@
               EOF
 
               chmod +x $out/bin/start-k8s
-              chmod +x $out/bin/chaos-test
+              chmod +x $out/bin/cleanup
               chmod +x $out/bin/start-everything
 
               # Install config files
