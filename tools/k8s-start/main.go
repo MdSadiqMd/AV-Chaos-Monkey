@@ -19,6 +19,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
 )
@@ -99,7 +100,7 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 	// Default to UDP relay which converts UDP to TCP for kubectl port-forward
 	if udpTargetHost == "" {
 		udpTargetHost = "udp-relay"
-		logInfo("Using UDP relay (UDP -> TCP -> localhost:5002)")
+		logInfo("Using UDP relay (UDP -> TCP -> localhost:%d)", constants.DefaultTargetPort)
 	}
 
 	systemMem, _ := utils.DetectSystemMemory()
@@ -670,7 +671,7 @@ func setupPortForwarding() {
 	fmt.Printf("  Orchestrator: %shttp://localhost:8080%s\n", utils.CYAN, utils.NC)
 	fmt.Printf("  Prometheus:   %shttp://localhost:9091%s\n", utils.CYAN, utils.NC)
 	fmt.Printf("  Grafana:      %shttp://localhost:3000%s (admin/admin)\n", utils.CYAN, utils.NC)
-	fmt.Printf("  UDP Receiver: %sUDP localhost:5002%s (run: go run ./examples/go/udp_receiver.go 5002)\n", utils.CYAN, utils.NC)
+	fmt.Printf("  UDP Receiver: %sUDP localhost:%d%s (run: go run ./examples/go/udp_receiver.go %d)\n", utils.CYAN, constants.DefaultTargetPort, utils.NC, constants.DefaultTargetPort)
 }
 
 // Starts the UDP relay chain to forward packets to localhost:5002
@@ -695,14 +696,14 @@ func setupUDPRelayChain(kubectlCmd string) {
 	// Start local TCP-to-UDP relay as embedded goroutine
 	go runLocalUDPRelay()
 
-	logSuccess("UDP relay chain active (Kubernetes -> localhost:5002)")
+	logSuccess("UDP relay chain active (Kubernetes -> localhost:%d)", constants.DefaultTargetPort)
 }
 
-// Connecting to TCP port 15001 and forwards packets to UDP localhost:5002
+// Connecting to TCP port 15001 and forwards packets to UDP localhost with configured port
 // This runs as a background goroutine and auto-reconnects on disconnect
 func runLocalUDPRelay() {
 	const tcpAddr = "localhost:15001"
-	const udpTarget = "localhost:5002"
+	udpTarget := fmt.Sprintf("localhost:%d", constants.DefaultTargetPort)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", udpTarget)
 	if err != nil {
@@ -710,8 +711,8 @@ func runLocalUDPRelay() {
 		return
 	}
 
-	// Create UDP socket bound to ephemeral port (not 5002!) for sending
-	localAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	// Create UDP socket bound to ephemeral port for sending
+	localAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", constants.DefaultTargetHost))
 	if err != nil {
 		logWarning("UDP relay: failed to resolve local address: %v", err)
 		return
@@ -781,7 +782,7 @@ func relayTCPToUDP(tcpAddr string, udpConn *net.UDPConn, udpAddr *net.UDPAddr, p
 
 		// Log progress periodically
 		if count == 1 || count%10000 == 0 {
-			// logInfo("UDP relay: forwarded %d packets to localhost:5002", count)
+			// logInfo("UDP relay: forwarded %d packets to localhost:%d", count, constants.DefaultTargetPort)
 			*lastLogTime = time.Now()
 		}
 	}

@@ -1,12 +1,12 @@
 // Architecture:
 // 1. In-cluster: udp-relay pod receives UDP on :5000, streams to TCP :5001 (length-prefixed)
 // 2. kubectl port-forward: TCP 15001 -> udp-relay:5001
-// 3. This tool: receives TCP on 15001, sends UDP to local receiver on 5002
+// 3. This tool: receives TCP on 15001, sends UDP to local receiver on configured port
 //
 // Testing:
 //   Terminal 1: kubectl port-forward udp-relay 15001:5001
 //   Terminal 2: go run ./tools/udp-relay/main.go
-//   Terminal 3: go run ./examples/go/udp_receiver.go 5002
+//   Terminal 3: go run ./examples/go/udp_receiver.go <port>
 
 package main
 
@@ -22,12 +22,14 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 )
 
 func main() {
 	var (
-		tcpAddr   = flag.String("tcp-addr", "localhost:15001", "TCP address to connect to (kubectl port-forward)")
-		udpTarget = flag.String("udp-target", "localhost:5002", "UDP target address (your local receiver)")
+		tcpAddr   = flag.String("tcp-addr", constants.UDPRelayTCPAddr, "TCP address to connect to (kubectl port-forward)")
+		udpTarget = flag.String("udp-target", constants.UDPRelayUDPAddr, "UDP target address (your local receiver)")
 		reconnect = flag.Bool("reconnect", true, "Auto-reconnect on disconnect")
 	)
 	flag.Parse()

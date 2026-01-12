@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/pion/webrtc/v3"
 )
@@ -245,10 +246,10 @@ func main() {
 		testReq := CreateTestRequest{
 			NumParticipants: 10, // Create enough to ensure at least one in each partition
 			Video: VideoConfig{
-				Width:       1280,
-				Height:      720,
-				FPS:         30,
-				BitrateKbps: 2500,
+				Width:       constants.DefaultWidth,
+				Height:      constants.DefaultHeight,
+				FPS:         constants.DefaultFPS,
+				BitrateKbps: constants.DefaultBitrateKbps,
 				Codec:       "h264",
 			},
 			Audio: AudioConfig{

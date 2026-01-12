@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/rtp"
@@ -40,10 +41,9 @@ type VirtualParticipant struct {
 	sequencer  uint16
 	timestamp  uint32
 
-	// Real UDP connection
+	// UDP connection
 	udpConn    *net.UDPConn
 	targetAddr *net.UDPAddr
-	udpEnabled bool
 
 	// Spikes
 	activeSpikesMu sync.RWMutex
@@ -93,8 +93,8 @@ func NewParticipantPool(testID string) *ParticipantPool {
 		participants:       make(map[uint32]*VirtualParticipant),
 		webrtcParticipants: make(map[uint32]WebRTCParticipant),
 		testID:             testID,
-		targetHost:         "127.0.0.1", // Default to localhost
-		metricsCacheTTL:    500 * time.Millisecond,
+		targetHost:         constants.DefaultTargetHost,
+		metricsCacheTTL:    constants.MetricsCacheTTL * time.Millisecond,
 	}
 	// background metrics aggregator
 	go pp.runMetricsAggregator()
@@ -119,8 +119,8 @@ func generateRandomBytes(length int) []byte {
 
 // Generate ICE ufrag and password
 func generateIceCredentials() (string, string) {
-	ufrag := make([]byte, 4)
-	password := make([]byte, 12)
+	ufrag := make([]byte, constants.IceUfragLength)
+	password := make([]byte, constants.IcePasswordLength)
 	cryptorand.Read(ufrag)
 	cryptorand.Read(password)
 	return hex.EncodeToString(ufrag), hex.EncodeToString(password)
@@ -142,15 +142,15 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 		AudioConfig:    audio,
 		IceUfrag:       iceUfrag,
 		IcePassword:    icePassword,
-		SrtpMasterKey:  generateRandomBytes(32),
-		SrtpMasterSalt: generateRandomBytes(14),
+		SrtpMasterKey:  generateRandomBytes(constants.SrtpMasterKeyLength),
+		SrtpMasterSalt: generateRandomBytes(constants.SrtpMasterSaltLength),
 		BackendRTPPort: backendPort,
 		metrics:        metrics.NewRTPMetrics(id),
-		packetizer:     rtp.NewH264Packetizer(id, 96, 90000),
+		packetizer:     rtp.NewH264Packetizer(id, constants.RTPPayloadType, constants.RTPClockRate),
 		activeSpikes:   make(map[string]*pb.SpikeEvent),
 	}
 
-	targetHost := "127.0.0.1"
+	targetHost := constants.DefaultTargetHost
 	targetPort := backendPort
 	if pp.targetPort > 0 {
 		// Use configured target for forwarding to external application
@@ -159,10 +159,9 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 	}
 
 	if err := participant.SetupUDP(targetHost, targetPort); err != nil {
-		log.Printf("[Pool] Warning: Failed to setup UDP for participant %d: %v (falling back to simulation)", id, err)
-	} else {
-		log.Printf("[Pool] Participant %d: UDP enabled, sending RTP packets to %s:%d", id, targetHost, targetPort)
+		return nil, fmt.Errorf("failed to setup UDP for participant %d: %w", id, err)
 	}
+	log.Printf("[Pool] Participant %d: UDP ready, sending RTP packets to %s:%d", id, targetHost, targetPort)
 
 	pp.participants[id] = participant
 	log.Printf("[Pool] Added participant %d on port %d", id, backendPort)
@@ -170,7 +169,7 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 	return participant, nil
 }
 
-// SetupUDP initializes the UDP connection for real packet transmission
+// SetupUDP initializes the UDP connection for packet transmission
 func (p *VirtualParticipant) SetupUDP(host string, port int) error {
 	// Create local UDP socket
 	localAddr, err := net.ResolveUDPAddr("udp", ":0") // Any available port
@@ -192,7 +191,6 @@ func (p *VirtualParticipant) SetupUDP(host string, port int) error {
 
 	p.udpConn = conn
 	p.targetAddr = targetAddr
-	p.udpEnabled = true
 
 	log.Printf("[Participant %d] UDP socket ready: local=%s target=%s", p.ID, conn.LocalAddr(), targetAddr)
 	return nil
@@ -259,18 +257,17 @@ func (pp *ParticipantPool) Start() {
 
 	// Start UDP participants in batches to avoid overwhelming the system
 	// Use smaller batch size and longer delays to prevent OOM kills
-	// For 150 participants per pod, this takes ~1.5 seconds to start all
-	batchSize := 25
-	batchDelay := 50 * time.Millisecond
+	batchSize := constants.DefaultBatchSize
+	batchDelay := constants.DefaultBatchDelay * time.Millisecond
 
 	// For large participant counts, use even smaller batches
-	if participantCount > 100 {
-		batchSize = 20
-		batchDelay = 75 * time.Millisecond
+	if participantCount > constants.LargeParticipantCount {
+		batchSize = constants.LargeBatchSize
+		batchDelay = constants.LargeBatchDelay * time.Millisecond
 	}
-	if participantCount > 200 {
-		batchSize = 15
-		batchDelay = 100 * time.Millisecond
+	if participantCount > constants.VeryLargeParticipantCount {
+		batchSize = constants.VeryLargeBatchSize
+		batchDelay = constants.VeryLargeBatchDelay * time.Millisecond
 	}
 
 	log.Printf("[Pool] Starting %d UDP participants in batches of %d", participantCount, batchSize)
@@ -326,7 +323,7 @@ func (pp *ParticipantPool) Stop() {
 
 // Background worker to update cached metrics
 func (pp *ParticipantPool) runMetricsAggregator() {
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(constants.MetricsAggregatorTick * time.Millisecond)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -383,8 +380,8 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 	participantMetrics := make([]*pb.ParticipantMetrics, 0, participantCount)
 	if participantCount > 0 && len(participantsList) > 0 {
 		sampleRate := 1
-		if participantCount > 100 {
-			sampleRate = participantCount / 100 // Sample to keep ~100 participants max
+		if participantCount > constants.MaxSampledParticipants {
+			sampleRate = participantCount / constants.MaxSampledParticipants
 		}
 
 		for i, p := range participantsList {
@@ -507,7 +504,7 @@ func (p *VirtualParticipant) Stop() {
 func (p *VirtualParticipant) runFrameLoop() {
 	fps := p.VideoConfig.Fps
 	if fps <= 0 {
-		fps = 30
+		fps = constants.DefaultFPS
 	}
 
 	ticker := time.NewTicker(time.Duration(1000/fps) * time.Millisecond)
@@ -533,34 +530,31 @@ func (p *VirtualParticipant) runFrameLoop() {
 		// Update counters
 		p.frameCount.Add(1)
 		p.sequencer += uint16(len(packets))
-		p.timestamp += uint32(90000 / fps)
+		p.timestamp += uint32(constants.RTPClockRate / fps)
 
 		for _, pkt := range packets {
-			// Serialize RTP packet first (needed for size calculation)
+			// Serialize RTP packet
 			data := pkt.Marshal()
 
-			// Always count packet as sent (even if we drop it due to spike)
+			// Count packet as sent
 			p.packetsSent.Add(1)
 			p.bytesSent.Add(int64(len(data)))
 			p.metrics.RecordPacketSent(len(data))
 
-			// Apply packet loss spike if active (after counting as sent)
+			// Apply packet loss spike if active (simulates network loss)
 			if p.shouldDropPacket() {
 				p.metrics.RecordPacketLost()
-				continue // Don't actually send the packet
+				continue // Don't send the packet
 			}
 
-			// Send real UDP packet if enabled
-			if p.udpEnabled && p.udpConn != nil && p.targetAddr != nil {
-				_, err := p.udpConn.WriteToUDP(data, p.targetAddr)
-				if err != nil {
-					// Network error - count as lost (already counted as sent above)
-					p.metrics.RecordPacketLost()
-					continue
-				}
-				// Packet sent successfully (already counted above)
+			// Send UDP packet
+			_, err := p.udpConn.WriteToUDP(data, p.targetAddr)
+			if err != nil {
+				// Network error - count as lost
+				p.metrics.RecordPacketLost()
+				log.Printf("[Participant %d] UDP send error: %v", p.ID, err)
+				continue
 			}
-			// If UDP not enabled, packet is simulated (already counted above)
 		}
 	}
 }
@@ -571,16 +565,16 @@ func (p *VirtualParticipant) generateSyntheticFrame() []byte {
 	// Frame size based on bitrate and FPS
 	fps := p.VideoConfig.Fps
 	if fps <= 0 {
-		fps = 30
+		fps = constants.DefaultFPS
 	}
 	bitrateKbps := p.VideoConfig.BitrateKbps
 	if bitrateKbps <= 0 {
-		bitrateKbps = 2500
+		bitrateKbps = constants.DefaultBitrateKbps
 	}
 
 	// Calculate frame size: bitrate_kbps * 1000 / 8 / fps
 	frameSize := (bitrateKbps * 1000 / 8) / int32(fps)
-	frameSize = max(1000, min(frameSize, 100000)) // Cap to prevent memory issues
+	frameSize = max(constants.MinFrameSize, min(frameSize, constants.MaxFrameSize))
 
 	// Reuse or allocate frame buffer
 	p.frameBufferMu.Lock()
@@ -597,8 +591,8 @@ func (p *VirtualParticipant) generateSyntheticFrame() []byte {
 
 	// H.264 NAL unit header (1 byte)
 	// Format: forbidden_zero_bit (1) | nal_ref_idc (2) | nal_unit_type (5)
-	if frameNum%30 == 0 {
-		// IDR frame (keyframe) every 30 frames
+	if frameNum%constants.KeyframeInterval == 0 {
+		// IDR frame (keyframe)
 		data[0] = 0x65 // nal_ref_idc=3, nal_unit_type=5 (IDR slice)
 	} else {
 		// P-frame (non-IDR)
@@ -725,10 +719,6 @@ func (p *VirtualParticipant) GetSetup() *pb.ParticipantSetup {
 		SrtpMasterSalt: hex.EncodeToString(p.SrtpMasterSalt),
 		BackendRtpPort: int32(p.BackendRTPPort),
 	}
-}
-
-func (p *VirtualParticipant) IsUDPEnabled() bool {
-	return p.udpEnabled
 }
 
 // Return UDP transmission statistics

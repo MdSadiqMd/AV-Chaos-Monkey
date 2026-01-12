@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
 )
@@ -203,10 +204,10 @@ func createTest(client *utils.HTTPClient, config *Config) error {
 		TestID:          config.TestID,
 		NumParticipants: config.NumParticipants,
 		Video: VideoConfig{
-			Width:       1280,
-			Height:      720,
-			FPS:         30,
-			BitrateKbps: 2500,
+			Width:       constants.DefaultWidth,
+			Height:      constants.DefaultHeight,
+			FPS:         constants.DefaultFPS,
+			BitrateKbps: constants.DefaultBitrateKbps,
 			Codec:       "h264",
 		},
 		Audio: AudioConfig{
@@ -591,7 +592,7 @@ func injectFrameDropSpike(testID, spikeID string, participants []int, duration i
 
 func injectBitrateReduceSpike(testID, spikeID string, participants []int, duration int) {
 	reductionPercent := rand.Intn(50) + 30
-	newBitrate := 2500 * (100 - reductionPercent) / 100
+	newBitrate := constants.DefaultBitrateKbps * (100 - reductionPercent) / 100
 	transition := rand.Intn(5) + 1
 
 	spike := SpikeEvent{

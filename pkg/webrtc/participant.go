@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	"github.com/pion/rtp"
 	pionwebrtc "github.com/pion/webrtc/v3"
 )
@@ -65,16 +66,16 @@ func (g *H264FrameGenerator) NextFrame() ([]byte, error) {
 	// Calculate frame size based on bitrate
 	fps := g.config.FPS
 	if fps <= 0 {
-		fps = 30
+		fps = constants.DefaultFPS
 	}
 	bitrate := g.config.BitrateKbps
 	if bitrate <= 0 {
-		bitrate = 2500
+		bitrate = constants.DefaultBitrateKbps
 	}
 
 	// Frame size: bitrate_kbps * 1000 / 8 / fps
 	frameSize := (bitrate * 1000 / 8) / fps
-	frameSize = max(1000, min(frameSize, 100000)) // Cap to prevent memory issues
+	frameSize = max(constants.MinFrameSize, min(frameSize, constants.MaxFrameSize))
 
 	// Reuse buffer
 	if cap(g.buffer) < frameSize {
@@ -86,8 +87,8 @@ func (g *H264FrameGenerator) NextFrame() ([]byte, error) {
 
 	// Create H.264 NALU structure
 	// NAL unit header (1 byte): forbidden_zero_bit(1) | nal_ref_idc(2) | nal_unit_type(5)
-	if g.frameCount%30 == 0 {
-		// IDR frame (keyframe) every 30 frames
+	if g.frameCount%constants.KeyframeInterval == 0 {
+		// IDR frame (keyframe)
 		data[0] = 0x65 // nal_ref_idc=3, nal_unit_type=5 (IDR slice)
 	} else {
 		// P-frame
@@ -203,7 +204,7 @@ func NewParticipant(id uint32, config VideoConfig) (*VirtualParticipant, error) 
 	videoTrack, err := pionwebrtc.NewTrackLocalStaticRTP(
 		pionwebrtc.RTPCodecCapability{
 			MimeType:    pionwebrtc.MimeTypeH264,
-			ClockRate:   90000,
+			ClockRate:   constants.RTPClockRate,
 			SDPFmtpLine: "profile-level-id=42e01f;packetization-mode=1",
 		},
 		fmt.Sprintf("video-%d", id),
@@ -276,7 +277,7 @@ func (p *VirtualParticipant) Close() error {
 func (p *VirtualParticipant) streamVideo() {
 	fps := p.frameGen.config.FPS
 	if fps <= 0 {
-		fps = 30
+		fps = constants.DefaultFPS
 	}
 
 	ticker := time.NewTicker(time.Duration(1000/fps) * time.Millisecond)
@@ -325,7 +326,7 @@ func (p *VirtualParticipant) streamVideo() {
 
 		p.framesSent.Add(1)
 		seq += uint16(len(rtpPackets))
-		timestamp += uint32(90000 / fps)
+		timestamp += uint32(constants.RTPClockRate / fps)
 	}
 }
 
@@ -623,7 +624,7 @@ func packetizeH264(nalu []byte, seq uint16, timestamp uint32, ssrc uint32) []*rt
 				Padding:        false,
 				Extension:      false,
 				Marker:         true,
-				PayloadType:    96, // H.264
+				PayloadType:    constants.RTPPayloadType,
 				SequenceNumber: seq,
 				Timestamp:      timestamp,
 				SSRC:           ssrc * 1000,
@@ -664,7 +665,7 @@ func packetizeH264(nalu []byte, seq uint16, timestamp uint32, ssrc uint32) []*rt
 					Padding:        false,
 					Extension:      false,
 					Marker:         end >= len(data),
-					PayloadType:    96,
+					PayloadType:    constants.RTPPayloadType,
 					SequenceNumber: seq,
 					Timestamp:      timestamp,
 					SSRC:           ssrc * 1000,

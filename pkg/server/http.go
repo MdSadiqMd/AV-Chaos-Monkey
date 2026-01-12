@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	customMiddleware "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/middleware"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pool"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
@@ -141,10 +142,10 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 	// Default video config
 	if req.Video == nil {
 		req.Video = &pb.VideoConfig{
-			Width:       1280,
-			Height:      720,
-			Fps:         30,
-			BitrateKbps: 2500,
+			Width:       constants.DefaultWidth,
+			Height:      constants.DefaultHeight,
+			Fps:         constants.DefaultFPS,
+			BitrateKbps: constants.DefaultBitrateKbps,
 			Codec:       "h264",
 		}
 	}
@@ -168,8 +169,8 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d", udpTargetHost, udpTargetPort)
 	} else if udpTargetPort > 0 {
 		// If only port is set, use localhost
-		participantPool.SetTarget("127.0.0.1", udpTargetPort)
-		log.Printf("[HTTP] UDP transmission enabled: target=127.0.0.1:%d", udpTargetPort)
+		participantPool.SetTarget(constants.DefaultTargetHost, udpTargetPort)
+		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d", constants.DefaultTargetHost, udpTargetPort)
 	} else {
 		log.Printf("[HTTP] UDP transmission disabled (set UDP_TARGET_HOST and UDP_TARGET_PORT to enable)")
 	}
