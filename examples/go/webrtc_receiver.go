@@ -15,17 +15,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/pion/webrtc/v3"
 )
-
-func logf(format string, args ...interface{}) {
-	timestamp := time.Now().Format("2006-01-02T15:04:05.000")
-	log.Printf("[%s] %s", timestamp, fmt.Sprintf(format, args...))
-}
 
 func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 }
+
+// logf is an alias for the simple logging function from pkg/logging
+var logf = logging.LogSimple
 
 type CreateTestRequest struct {
 	NumParticipants int         `json:"num_participants"`

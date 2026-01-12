@@ -14,7 +14,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
+)
+
+var (
+	logInfo    = logging.LogInfo
+	logSuccess = logging.LogSuccess
+	logWarning = logging.LogWarning
+	logError   = logging.LogError
+	logChaos   = logging.LogChaos
+	logMetrics = logging.LogMetrics
 )
 
 type Config struct {
@@ -688,30 +698,6 @@ func showProgress(current, total int) {
 		utils.BOLD, percentage, utils.NC)
 }
 
-func timestamp() string {
-	return time.Now().Format("2006-01-02T15:04:05.000")
-}
-
-func logInfo(format string, args ...any) {
-	fmt.Printf("%s[%s][INFO]%s %s\n", utils.BLUE, timestamp(), utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logSuccess(format string, args ...any) {
-	fmt.Printf("%s[%s][✓]%s %s\n", utils.GREEN, timestamp(), utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logWarning(format string, args ...any) {
-	fmt.Printf("%s[%s][⚠]%s %s\n", utils.YELLOW, timestamp(), utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logError(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "%s[%s][✗]%s %s\n", utils.RED, timestamp(), utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logChaos(format string, args ...any) {
-	fmt.Printf("%s[%s][CHAOS]%s %s\n", utils.MAGENTA, timestamp(), utils.NC, fmt.Sprintf(format, args...))
-}
-
 func updateTargetFilesWithTestID(testID string) {
 	projectRoot := getProjectRoot()
 	targetsDir := filepath.Join(projectRoot, "config", "prometheus", "targets")
@@ -781,8 +767,4 @@ func getProjectRoot() string {
 		dir = parent
 	}
 	return "."
-}
-
-func logMetrics(format string, args ...any) {
-	fmt.Printf("%s[%s][METRICS]%s %s\n", utils.CYAN, timestamp(), utils.NC, fmt.Sprintf(format, args...))
 }

@@ -19,7 +19,16 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
+)
+
+var (
+	logInfo    = logging.LogInfo
+	logSuccess = logging.LogSuccess
+	logWarning = logging.LogWarning
+	logError   = logging.LogError
+	logConfig  = logging.LogConfig
 )
 
 const defaultClusterName = "av-chaos-monkey"
@@ -963,26 +972,6 @@ func verifyPartitionIDs() {
 			}
 		}
 	}
-}
-
-func logInfo(format string, args ...any) {
-	fmt.Printf("%s[INFO]%s %s\n", utils.BLUE, utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logSuccess(format string, args ...any) {
-	fmt.Printf("%s[✓]%s %s\n", utils.GREEN, utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logWarning(format string, args ...any) {
-	fmt.Printf("%s[⚠]%s %s\n", utils.YELLOW, utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logError(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "%s[✗]%s %s\n", utils.RED, utils.NC, fmt.Sprintf(format, args...))
-}
-
-func logConfig(format string, args ...any) {
-	fmt.Printf("%s[CONFIG]%s %s\n", utils.MAGENTA, utils.NC, fmt.Sprintf(format, args...))
 }
 
 func checkMetricsPartitions(replicas int) {
