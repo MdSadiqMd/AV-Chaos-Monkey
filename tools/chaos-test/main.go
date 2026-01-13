@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -417,7 +419,7 @@ func injectRandomSpike(_ *utils.HTTPClient, config *Config, spikeNum int) {
 	}
 }
 
-// Sending a spike to a single orchestrator pod, this spike will be applied to participants on that pod
+// Sending a spike to all orchestrator pods so it propagates evenly across all participants
 func broadcastSpike(testID string, spike SpikeEvent) {
 	if len(cachedPodNames) == 0 || cachedKubectlCmd == "" {
 		logWarning("Pod cache not initialized, spike may not reach pods")
@@ -430,34 +432,48 @@ func broadcastSpike(testID string, spike SpikeEvent) {
 		return
 	}
 
-	podName := cachedPodNames[rand.Intn(len(cachedPodNames))]
+	// Send spike to all pods concurrently
+	var wg sync.WaitGroup
+	successCount := int32(0)
 
-	curlCmd := fmt.Sprintf("curl -s --max-time 3 -X POST http://localhost:8080/api/v1/test/%s/spike -H 'Content-Type: application/json' -d @-", testID)
-	cmd := exec.Command(cachedKubectlCmd, "exec", "-i", podName, "--", "sh", "-c", curlCmd)
-	cmd.Stdin = strings.NewReader(string(spikeJSON))
+	for _, podName := range cachedPodNames {
+		wg.Add(1)
+		go func(pod string) {
+			defer wg.Done()
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := cmd.Output()
-		done <- err
-	}()
+			curlCmd := fmt.Sprintf("curl -s --max-time 3 -X POST http://localhost:8080/api/v1/test/%s/spike -H 'Content-Type: application/json' -d @-", testID)
+			cmd := exec.Command(cachedKubectlCmd, "exec", "-i", pod, "--", "sh", "-c", curlCmd)
+			cmd.Stdin = strings.NewReader(string(spikeJSON))
 
-	select {
-	case err := <-done:
-		if err != nil {
-			consecutiveFailures++
-			if consecutiveFailures >= 5 {
-				logWarning("Multiple spike failures - kubectl may be overloaded")
-				consecutiveFailures = 0
+			done := make(chan error, 1)
+			go func() {
+				_, err := cmd.Output()
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					atomic.AddInt32(&successCount, 1)
+				}
+			case <-time.After(4 * time.Second):
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+				}
 			}
-		} else {
+		}(podName)
+	}
+
+	wg.Wait()
+
+	if successCount == 0 {
+		consecutiveFailures++
+		if consecutiveFailures >= 5 {
+			logWarning("Multiple spike failures - kubectl may be overloaded")
 			consecutiveFailures = 0
 		}
-	case <-time.After(4 * time.Second):
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		consecutiveFailures++
+	} else {
+		consecutiveFailures = 0
 	}
 }
 
