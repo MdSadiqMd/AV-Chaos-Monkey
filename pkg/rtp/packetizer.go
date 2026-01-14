@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 )
 
-// RTPHeader represents an RTP packet header
+// Represents an RTP packet header
 type RTPHeader struct {
 	Version        uint8
 	Padding        bool
@@ -26,7 +26,7 @@ type Extension struct {
 	Data []byte
 }
 
-// RTPPacket represents a complete RTP packet
+// Represents a complete RTP packet
 type RTPPacket struct {
 	Header  RTPHeader
 	Payload []byte
@@ -41,7 +41,6 @@ type H264Packetizer struct {
 	ParticipantID uint32
 }
 
-// NewH264Packetizer creates a new H.264 packetizer
 func NewH264Packetizer(participantID uint32, payloadType uint8, clockRate uint32) *H264Packetizer {
 	return &H264Packetizer{
 		SSRC:          participantID * 1000, // Simple SSRC derivation
@@ -135,7 +134,7 @@ func (p *H264Packetizer) fragmentNALU(nalu []byte, maxSize int) [][]byte {
 	return fragments
 }
 
-// createParticipantIDExtension creates the custom participant_id extension
+// Creates the custom participant_id extension
 func (p *H264Packetizer) createParticipantIDExtension() []Extension {
 	data := make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, p.ParticipantID)
@@ -251,7 +250,6 @@ func Unmarshal(data []byte) (*RTPPacket, error) {
 	return pkt, nil
 }
 
-// Error types
 type rtpError string
 
 func (e rtpError) Error() string { return string(e) }
