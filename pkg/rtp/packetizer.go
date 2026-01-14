@@ -1,10 +1,8 @@
 package rtp
 
-import (
-	"encoding/binary"
-)
+import "encoding/binary"
 
-// Represents an RTP packet header
+// RTP packet header
 type RTPHeader struct {
 	Version        uint8
 	Padding        bool
@@ -20,13 +18,13 @@ type RTPHeader struct {
 	Extensions     []Extension
 }
 
-// Extension represents an RTP header extension
+// RTP header extension
 type Extension struct {
 	ID   uint8
 	Data []byte
 }
 
-// Represents a complete RTP packet
+// Complete RTP packet
 type RTPPacket struct {
 	Header  RTPHeader
 	Payload []byte
