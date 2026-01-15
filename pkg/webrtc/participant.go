@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/media"
 	"github.com/pion/rtp"
 	pionwebrtc "github.com/pion/webrtc/v3"
 )
@@ -32,6 +33,11 @@ type VirtualParticipant struct {
 	audioTrack *pionwebrtc.TrackLocalStaticRTP
 	frameGen   *H264FrameGenerator
 	active     atomic.Bool
+
+	// Media source
+	mediaSource   *media.MediaSource
+	videoFrameIdx int
+	audioFrameIdx int
 
 	// Metrics
 	framesSent  atomic.Int64
@@ -247,6 +253,7 @@ func NewParticipant(id uint32, config VideoConfig) (*VirtualParticipant, error) 
 		videoTrack:   videoTrack,
 		audioTrack:   audioTrack,
 		frameGen:     NewH264FrameGenerator(config),
+		mediaSource:  media.GetGlobalMediaSource(),
 		activeSpikes: make(map[string]map[string]string),
 	}
 
@@ -275,16 +282,21 @@ func (p *VirtualParticipant) Close() error {
 
 // Generates and sends real video RTP packets
 func (p *VirtualParticipant) streamVideo() {
-	fps := p.frameGen.config.FPS
-	if fps <= 0 {
-		fps = constants.DefaultFPS
-	}
+	fps := constants.StreamingFPS // Use consistent FPS with media source
 
 	ticker := time.NewTicker(time.Duration(1000/fps) * time.Millisecond)
 	defer ticker.Stop()
 
 	seq := uint16(0)
 	timestamp := uint32(0)
+
+	hasRealMedia := p.mediaSource != nil && p.mediaSource.GetTotalVideoFrames() > 0
+	if hasRealMedia {
+		log.Printf("[WebRTC] Participant %d: Streaming real video from media source (%d frames)",
+			p.id, p.mediaSource.GetTotalVideoFrames())
+	} else {
+		log.Printf("[WebRTC] Participant %d: Using synthetic video frames (no media source)", p.id)
+	}
 
 	for range ticker.C {
 		if !p.active.Load() {
@@ -293,13 +305,41 @@ func (p *VirtualParticipant) streamVideo() {
 
 		// Check for frame drop
 		if p.shouldDropFrame() {
+			p.videoFrameIdx++
 			continue
 		}
 
-		frame, err := p.frameGen.NextFrame()
-		if err != nil {
-			log.Printf("[WebRTC] Frame generation error: %v", err)
-			continue
+		var frame []byte
+		var err error
+
+		if hasRealMedia {
+			// Get NAL unit from media source
+			nal := p.mediaSource.GetVideoNAL(p.videoFrameIdx)
+			if nal == nil || len(nal.Data) == 0 {
+				// Loop back to beginning when media ends
+				p.videoFrameIdx = 0
+				nal = p.mediaSource.GetVideoNAL(p.videoFrameIdx)
+				if nal == nil || len(nal.Data) == 0 {
+					// Fall back to synthetic if still no data
+					frame, err = p.frameGen.NextFrame()
+					if err != nil {
+						log.Printf("[WebRTC] Frame generation error: %v", err)
+						continue
+					}
+				} else {
+					frame = nal.Data
+				}
+			} else {
+				frame = nal.Data
+			}
+			p.videoFrameIdx++
+		} else {
+			// Use synthetic frames
+			frame, err = p.frameGen.NextFrame()
+			if err != nil {
+				log.Printf("[WebRTC] Frame generation error: %v", err)
+				continue
+			}
 		}
 
 		// Packetize H.264 NALU → RTP and send
@@ -340,6 +380,14 @@ func (p *VirtualParticipant) streamAudio() {
 	timestamp := uint32(0)
 	const samplesPerFrame = 960 // 48000 Hz * 20ms = 960 samples
 
+	hasRealMedia := p.mediaSource != nil && p.mediaSource.GetTotalAudioFrames() > 0
+	if hasRealMedia {
+		log.Printf("[WebRTC] Participant %d: Streaming real audio from media source (%d frames)",
+			p.id, p.mediaSource.GetTotalAudioFrames())
+	} else {
+		log.Printf("[WebRTC] Participant %d: Using synthetic audio frames (no media source)", p.id)
+	}
+
 	for range ticker.C {
 		if !p.active.Load() {
 			return
@@ -367,8 +415,29 @@ func (p *VirtualParticipant) streamAudio() {
 			continue
 		}
 
-		// Generate synthetic Opus-like audio frame
-		audioFrame := generateOpusFrame(p.id, seq)
+		var audioFrame []byte
+
+		if hasRealMedia {
+			// Get audio packet from media source
+			packet := p.mediaSource.GetAudioPacket(p.audioFrameIdx)
+			if packet == nil || len(packet.Data) == 0 {
+				// Loop back to beginning when media ends
+				p.audioFrameIdx = 0
+				packet = p.mediaSource.GetAudioPacket(p.audioFrameIdx)
+				if packet == nil || len(packet.Data) == 0 {
+					// Fall back to synthetic if still no data
+					audioFrame = generateOpusFrame(p.id, seq)
+				} else {
+					audioFrame = packet.Data
+				}
+			} else {
+				audioFrame = packet.Data
+			}
+			p.audioFrameIdx++
+		} else {
+			// Generate synthetic Opus-like audio frame
+			audioFrame = generateOpusFrame(p.id, seq)
+		}
 
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
