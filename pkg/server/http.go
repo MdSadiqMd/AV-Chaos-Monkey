@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/media"
 	customMiddleware "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/middleware"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pool"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
@@ -55,8 +56,9 @@ func (ts *TestSession) StateValue() int {
 func NewHTTPServer(addr string) *HTTPServer {
 	partitionID := getEnvInt("PARTITION_ID", 0)
 	totalPartitions := getEnvInt("TOTAL_PARTITIONS", 1)
-
 	log.Printf("[HTTP] Partition config: ID=%d, Total=%d", partitionID, totalPartitions)
+
+	initMediaSource()
 
 	return &HTTPServer{
 		addr:            addr,
@@ -64,6 +66,68 @@ func NewHTTPServer(addr string) *HTTPServer {
 		spikeInject:     spike.NewInjector(),
 		partitionID:     partitionID,
 		totalPartitions: totalPartitions,
+	}
+}
+
+func initMediaSource() {
+	videoPath := os.Getenv("MEDIA_VIDEO_PATH")
+	audioPath := os.Getenv("MEDIA_AUDIO_PATH")
+	mediaPath := os.Getenv("MEDIA_PATH")
+
+	mediaSource := media.GetGlobalMediaSource()
+
+	// Determine what to load
+	var config media.MediaConfig
+
+	if mediaPath != "" {
+		// Combined media file
+		log.Printf("[HTTP] Using media file: %s", mediaPath)
+		config = media.MediaConfig{
+			VideoPath:    mediaPath,
+			AudioPath:    mediaPath,
+			VideoEnabled: true,
+			AudioEnabled: true,
+		}
+	} else if videoPath != "" || audioPath != "" {
+		// Individual files
+		config = media.MediaConfig{
+			VideoPath:    videoPath,
+			AudioPath:    audioPath,
+			VideoEnabled: videoPath != "",
+			AudioEnabled: audioPath != "",
+		}
+		if videoPath != "" {
+			log.Printf("[HTTP] Using video file: %s", videoPath)
+		}
+		if audioPath != "" {
+			log.Printf("[HTTP] Using audio file: %s", audioPath)
+		}
+	} else {
+		// Try default media file
+		defaultMedia := "/app/public/rick-roll.mp4"
+		if _, err := os.Stat(defaultMedia); err == nil {
+			log.Printf("[HTTP] Using default media file: %s", defaultMedia)
+			config = media.MediaConfig{
+				VideoPath:    defaultMedia,
+				AudioPath:    defaultMedia,
+				VideoEnabled: true,
+				AudioEnabled: true,
+			}
+		} else {
+			log.Printf("[HTTP] No media files configured, using synthetic frames")
+			return
+		}
+	}
+
+	if err := mediaSource.Initialize(config); err != nil {
+		log.Printf("[HTTP] Warning: Failed to initialize media source: %v (using synthetic frames)", err)
+	} else {
+		// Set streaming FPS from constants
+		mediaSource.SetStreamingFPS(constants.StreamingFPS)
+		log.Printf("[HTTP] Media source initialized: video=%v (%d NALs), audio=%v (%d packets), duration=%.1fs at %dfps",
+			mediaSource.IsVideoEnabled(), mediaSource.GetVideoCount(),
+			mediaSource.IsAudioEnabled(), mediaSource.GetAudioCount(),
+			mediaSource.GetMediaDuration().Seconds(), constants.StreamingFPS)
 	}
 }
 
