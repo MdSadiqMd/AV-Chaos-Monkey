@@ -24,13 +24,18 @@ FROM alpine:latest
 RUN apk add --no-cache \
     ca-certificates \
     dumb-init \
-    curl
+    curl \
+    ffmpeg
 
 # Create non-root user
 RUN adduser -D -u 1000 app
 USER app
 
 COPY --from=builder /orchestrator /usr/local/bin/orchestrator
+
+COPY --chown=app:app public /app/public
+
+WORKDIR /app
 
 EXPOSE 8080
 

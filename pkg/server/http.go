@@ -103,9 +103,22 @@ func initMediaSource() {
 			log.Printf("[HTTP] Using audio file: %s", audioPath)
 		}
 	} else {
-		// Try default media file
-		defaultMedia := "/app/public/rick-roll.mp4"
-		if _, err := os.Stat(defaultMedia); err == nil {
+		// Try default media file(Docker and local paths)
+		defaultPaths := []string{
+			"/app/public/rick-roll.mp4",
+			"public/rick-roll.mp4",
+			"./public/rick-roll.mp4",
+		}
+
+		var defaultMedia string
+		for _, path := range defaultPaths {
+			if _, err := os.Stat(path); err == nil {
+				defaultMedia = path
+				break
+			}
+		}
+
+		if defaultMedia != "" {
 			log.Printf("[HTTP] Using default media file: %s", defaultMedia)
 			config = media.MediaConfig{
 				VideoPath:    defaultMedia,
