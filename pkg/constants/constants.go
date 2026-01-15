@@ -24,8 +24,13 @@ const (
 	MaxFrameSize       = 100000
 	KeyframeInterval   = 30
 
-	RTPPayloadType = 96
-	RTPClockRate   = 90000
+	StreamingFPS = 60
+
+	RTPPayloadType     = 96    // H.264 video
+	RTPPayloadTypeOpus = 111   // Opus audio
+	RTPClockRate       = 90000 // Video clock rate
+	RTPClockRateOpus   = 48000 // Opus clock rate
+	OpusFrameDuration  = 20    // milliseconds per Opus frame
 
 	IceUfragLength    = 4
 	IcePasswordLength = 12
@@ -38,4 +43,6 @@ const (
 	UDPRelayTCPPort = 15001
 	UDPRelayTCPAddr = "localhost:15001"
 	UDPRelayUDPAddr = "localhost:5002"
+
+	DefaultMediaPath = "public/rick-roll.mp4"
 )

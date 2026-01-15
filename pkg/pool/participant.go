@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/media"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/rtp"
@@ -37,19 +38,27 @@ type VirtualParticipant struct {
 	metrics *metrics.RTPMetrics
 
 	// RTP
-	packetizer *rtp.H264Packetizer
-	sequencer  uint16
-	timestamp  uint32
+	packetizer      *rtp.H264Packetizer
+	audioPacketizer *rtp.OpusPacketizer
+	sequencer       uint16
+	audioSequencer  uint16
+	timestamp       uint32
+	audioTimestamp  uint32
 
 	// UDP connection
 	udpConn    *net.UDPConn
 	targetAddr *net.UDPAddr
 
+	// Media source
+	mediaSource   *media.MediaSource
+	videoFrameIdx int
+	audioFrameIdx int
+
 	// Spikes
 	activeSpikesMu sync.RWMutex
 	activeSpikes   map[string]*pb.SpikeEvent
 
-	// Memory optimization: reusable frame buffer
+	// Memory optimization: reusable frame buffer (for synthetic fallback)
 	frameBufferMu sync.Mutex
 	frameBuffer   []byte
 }
@@ -137,17 +146,19 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 	iceUfrag, icePassword := generateIceCredentials()
 
 	participant := &VirtualParticipant{
-		ID:             id,
-		VideoConfig:    video,
-		AudioConfig:    audio,
-		IceUfrag:       iceUfrag,
-		IcePassword:    icePassword,
-		SrtpMasterKey:  generateRandomBytes(constants.SrtpMasterKeyLength),
-		SrtpMasterSalt: generateRandomBytes(constants.SrtpMasterSaltLength),
-		BackendRTPPort: backendPort,
-		metrics:        metrics.NewRTPMetrics(id),
-		packetizer:     rtp.NewH264Packetizer(id, constants.RTPPayloadType, constants.RTPClockRate),
-		activeSpikes:   make(map[string]*pb.SpikeEvent),
+		ID:              id,
+		VideoConfig:     video,
+		AudioConfig:     audio,
+		IceUfrag:        iceUfrag,
+		IcePassword:     icePassword,
+		SrtpMasterKey:   generateRandomBytes(constants.SrtpMasterKeyLength),
+		SrtpMasterSalt:  generateRandomBytes(constants.SrtpMasterSaltLength),
+		BackendRTPPort:  backendPort,
+		metrics:         metrics.NewRTPMetrics(id),
+		packetizer:      rtp.NewH264Packetizer(id, constants.RTPPayloadType, constants.RTPClockRate),
+		audioPacketizer: rtp.NewOpusPacketizer(id, constants.RTPPayloadTypeOpus, constants.RTPClockRateOpus),
+		mediaSource:     media.GetGlobalMediaSource(),
+		activeSpikes:    make(map[string]*pb.SpikeEvent),
 	}
 
 	targetHost := constants.DefaultTargetHost
@@ -491,7 +502,19 @@ func (pp *ParticipantPool) Size() int {
 
 func (p *VirtualParticipant) Start() {
 	p.active.Store(true)
-	go p.runFrameLoop()
+
+	// Start video streaming if enabled
+	if p.mediaSource.IsVideoEnabled() {
+		go p.runVideoLoop()
+	} else {
+		// Fall back to synthetic frames if no media source
+		go p.runFrameLoop()
+	}
+
+	// Start audio streaming if enabled
+	if p.mediaSource.IsAudioEnabled() {
+		go p.runAudioLoop()
+	}
 }
 
 func (p *VirtualParticipant) Stop() {
@@ -607,6 +630,126 @@ func (p *VirtualParticipant) generateSyntheticFrame() []byte {
 	}
 
 	return data
+}
+
+// Streaming video from media source
+func (p *VirtualParticipant) runVideoLoop() {
+	// Use streaming FPS from constants (all participants use same rate)
+	fps := constants.StreamingFPS
+
+	ticker := time.NewTicker(time.Duration(1000/fps) * time.Millisecond)
+	defer ticker.Stop()
+
+	totalFrames := p.mediaSource.GetTotalVideoFrames()
+	log.Printf("[Participant %d] Starting video stream: %d frames at %dfps (duration=%.1fs)",
+		p.ID, totalFrames, fps, float64(totalFrames)/float64(fps))
+
+	for range ticker.C {
+		if !p.active.Load() {
+			return
+		}
+
+		// Check for frame drop spike
+		if p.shouldDropFrame() {
+			p.metrics.RecordFrameDropped()
+			p.videoFrameIdx++
+			continue
+		}
+
+		// Get next NAL unit from media source (returns nil when media ends)
+		nal := p.mediaSource.GetVideoNAL(p.videoFrameIdx)
+		if nal == nil || len(nal.Data) == 0 {
+			// End of media reached
+			log.Printf("[Participant %d] Video stream complete: sent %d frames", p.ID, p.videoFrameIdx)
+			return
+		}
+
+		// Packetize NAL unit
+		packets := p.packetizer.Packetize(nal.Data, p.sequencer, p.timestamp)
+
+		// Update counters
+		p.frameCount.Add(1)
+		p.videoFrameIdx++
+		p.sequencer += uint16(len(packets))
+		p.timestamp += uint32(constants.RTPClockRate / int32(fps))
+
+		for _, pkt := range packets {
+			// Serialize RTP packet
+			data := pkt.Marshal()
+
+			// Count packet as sent
+			p.packetsSent.Add(1)
+			p.bytesSent.Add(int64(len(data)))
+			p.metrics.RecordPacketSent(len(data))
+
+			// Apply packet loss spike if active
+			if p.shouldDropPacket() {
+				p.metrics.RecordPacketLost()
+				continue
+			}
+
+			// Send UDP packet
+			_, err := p.udpConn.WriteToUDP(data, p.targetAddr)
+			if err != nil {
+				p.metrics.RecordPacketLost()
+				continue
+			}
+		}
+	}
+}
+
+// Streaming real audio from media source
+func (p *VirtualParticipant) runAudioLoop() {
+	// Opus uses 20ms frames
+	ticker := time.NewTicker(constants.OpusFrameDuration * time.Millisecond)
+	defer ticker.Stop()
+
+	totalFrames := p.mediaSource.GetTotalAudioFrames()
+	log.Printf("[Participant %d] Starting audio stream: %d frames (duration=%.1fs)",
+		p.ID, totalFrames, float64(totalFrames)*float64(constants.OpusFrameDuration)/1000.0)
+
+	for range ticker.C {
+		if !p.active.Load() {
+			return
+		}
+
+		// Get next audio packet from media source (returns nil when media ends)
+		packet := p.mediaSource.GetAudioPacket(p.audioFrameIdx)
+		if packet == nil || len(packet.Data) == 0 {
+			// End of media reached
+			log.Printf("[Participant %d] Audio stream complete: sent %d frames", p.ID, p.audioFrameIdx)
+			return
+		}
+
+		// Create RTP packet for audio
+		rtpPacket := p.audioPacketizer.Packetize(packet.Data, p.audioSequencer, p.audioTimestamp)
+
+		// Update counters
+		p.audioFrameIdx++
+		p.audioSequencer++
+		// Opus at 48kHz with 20ms frames = 960 samples per frame
+		p.audioTimestamp += 960
+
+		// Serialize and send
+		data := rtpPacket.Marshal()
+
+		p.packetsSent.Add(1)
+		p.bytesSent.Add(int64(len(data)))
+		p.metrics.RecordPacketSent(len(data))
+
+		// Apply packet loss spike if active
+		if p.shouldDropPacket() {
+			p.metrics.RecordPacketLost()
+			continue
+		}
+
+		// Send UDP packet
+		_, err := p.udpConn.WriteToUDP(data, p.targetAddr)
+		if err != nil {
+			p.metrics.RecordPacketLost()
+			continue
+		}
+	}
 }
 
 // Checks if current frame should be dropped
