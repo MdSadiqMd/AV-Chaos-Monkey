@@ -162,7 +162,7 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 	}
 
 	targetHost := constants.DefaultTargetHost
-	targetPort := backendPort
+	targetPort := constants.DefaultTargetPort
 	if pp.targetPort > 0 {
 		// Use configured target for forwarding to external application
 		targetHost = pp.targetHost

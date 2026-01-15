@@ -90,6 +90,9 @@
               protoc-gen-go
               protoc-gen-go-grpc
 
+              # Media tools (for extracting video/audio from files)
+              ffmpeg
+
               # Script dependencies
               bash
               coreutils
@@ -103,7 +106,7 @@
             ];
 
             shellHook = ''
-              echo "🚀 AV Chaos Monkey Development Environment"
+              echo "🚀 AV Chaos Monkey Nix Development Environment"
               echo ""
               echo "Available commands:"
               echo "  nix develop          - Enter this development shell"
@@ -116,6 +119,7 @@
               echo "  nix build .#packages.aarch64-darwin.av-chaos-monkey     - macOS Apple Silicon"
               echo ""
               echo "Go version: $(go version)"
+              echo "FFmpeg: $(ffmpeg -version 2>&1 | head -1)"
               echo "Docker: $(docker --version 2>/dev/null || echo 'not available')"
               echo "Kubectl: $(kubectl version --client --short 2>/dev/null || echo 'not available')"
               echo "Kind: $(kind --version 2>/dev/null || echo 'not available')"
@@ -124,6 +128,12 @@
               echo "  kind create cluster --name av-chaos-monkey  - Create K8s cluster"
               echo "  kind delete cluster --name av-chaos-monkey   - Delete K8s cluster"
               echo "  kubectl cluster-info --context kind-av-chaos-monkey  - Check cluster"
+              echo ""
+              echo "Media streaming:"
+              echo "  ./scripts/start_everything.sh run                    - Use default media (public/rick-roll.mp4)"
+              echo "  ./scripts/start_everything.sh run --video=<path>     - Video only"
+              echo "  ./scripts/start_everything.sh run --audio=<path>     - Audio only"
+              echo "  ./scripts/start_everything.sh run --media=<path>     - Custom media file"
               echo ""
             '';
           };
