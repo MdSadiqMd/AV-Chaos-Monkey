@@ -34,6 +34,12 @@ var (
 
 const defaultClusterName = "av-chaos-monkey"
 
+type MediaConfig struct {
+	VideoPath string
+	AudioPath string
+	MediaPath string
+}
+
 func main() {
 	var (
 		replicas        = flag.Int("replicas", 0, "Number of replicas (0 = auto-detect)")
@@ -44,6 +50,9 @@ func main() {
 		clusterName     = flag.String("name", defaultClusterName, "Kubernetes cluster name")
 		udpTargetHost   = flag.String("udp-target-host", "", "UDP target host (empty = in-cluster udp-receiver)")
 		udpTargetPort   = flag.Int("udp-target-port", 5000, "UDP target port")
+		videoPath       = flag.String("video", "", "Path to video file (mp4) for streaming")
+		audioPath       = flag.String("audio", "", "Path to audio file (mp3) for streaming")
+		mediaPath       = flag.String("media", "", "Path to media file (mkv/mp4) containing both video and audio")
 	)
 	flag.Parse()
 
@@ -86,13 +95,19 @@ func main() {
 	}
 
 	projectRoot := getProjectRoot()
-	if err := runK8sDeployment(projectRoot, *replicas, *numParticipants, *skipTest, *udpTargetHost, *udpTargetPort); err != nil {
+	mediaConfig := MediaConfig{
+		VideoPath: *videoPath,
+		AudioPath: *audioPath,
+		MediaPath: *mediaPath,
+	}
+
+	if err := runK8sDeployment(projectRoot, *replicas, *numParticipants, *skipTest, *udpTargetHost, *udpTargetPort, mediaConfig); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, skipTest bool, udpTargetHost string, udpTargetPort int) error {
+func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, skipTest bool, udpTargetHost string, udpTargetPort int, mediaConfig MediaConfig) error {
 	if err := checkPrerequisites(); err != nil {
 		return err
 	}
@@ -139,6 +154,19 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 	fmt.Printf("  Memory per pod:    %s2GB%s\n", utils.CYAN, utils.NC)
 	fmt.Printf("  Total memory:      %s%dGB%s (pods + monitoring)\n", utils.CYAN, replicas*2+2, utils.NC)
 	fmt.Printf("  Throughput:        %s%dx%s\n", utils.CYAN, replicas, utils.NC)
+
+	if mediaConfig.MediaPath != "" {
+		fmt.Printf("  Media:             %s%s%s (video+audio)\n", utils.CYAN, mediaConfig.MediaPath, utils.NC)
+	} else if mediaConfig.VideoPath != "" || mediaConfig.AudioPath != "" {
+		if mediaConfig.VideoPath != "" {
+			fmt.Printf("  Video:             %s%s%s\n", utils.CYAN, mediaConfig.VideoPath, utils.NC)
+		}
+		if mediaConfig.AudioPath != "" {
+			fmt.Printf("  Audio:             %s%s%s\n", utils.CYAN, mediaConfig.AudioPath, utils.NC)
+		}
+	} else {
+		fmt.Printf("  Media:             %sdefault (public/rick-roll.mp4)%s\n", utils.CYAN, utils.NC)
+	}
 	fmt.Println()
 
 	if err := buildImage(projectRoot); err != nil {
