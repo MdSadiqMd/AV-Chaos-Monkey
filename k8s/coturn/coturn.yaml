@@ -1,11 +1,12 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: coturn
   labels:
     app: coturn
 spec:
-  replicas: 1
+  serviceName: coturn
+  replicas: 3 # Initial replicas, HPA will adjust based on load
   selector:
     matchLabels:
       app: coturn
@@ -32,8 +33,10 @@ spec:
               value: "webrtc"
             - name: TURN_PASSWORD
               value: "webrtc123"
-            - name: EXTERNAL_IP
-              value: "" # Will be set if needed
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           command:
             - /bin/sh
             - -c
@@ -51,19 +54,46 @@ spec:
                 --no-dtls \
                 --fingerprint \
                 --lt-cred-mech \
-                --server-name=chaos-monkey-turn
+                --server-name=${POD_NAME} \
+                --total-quota=2000 \
+                --bps-capacity=0 \
+                --max-bps=0 \
+                --relay-threads=4
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
 ---
+# Headless service for individual pod DNS resolution
+# Enables direct access to specific pods: coturn-0.coturn, coturn-1.coturn, etc.
 apiVersion: v1
 kind: Service
 metadata:
   name: coturn
+  labels:
+    app: coturn
+spec:
+  clusterIP: None # Headless service
+  ports:
+    - port: 3478
+      targetPort: 3478
+      protocol: TCP
+      name: turn-tcp
+    - port: 3478
+      targetPort: 3478
+      protocol: UDP
+      name: turn-udp
+  selector:
+    app: coturn
+---
+# Load-balanced service for fallback/general access
+apiVersion: v1
+kind: Service
+metadata:
+  name: coturn-lb
   labels:
     app: coturn
 spec:
@@ -79,3 +109,46 @@ spec:
       name: turn-udp
   selector:
     app: coturn
+
+---
+# HorizontalPodAutoscaler for automatic scaling based on CPU
+# Scales coturn replicas based on load (~500 participants per replica)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: coturn-hpa
+  labels:
+    app: coturn
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: coturn
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

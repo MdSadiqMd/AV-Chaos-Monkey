@@ -104,7 +104,9 @@ spec:
                 fieldRef:
                   fieldPath: status.hostIP
             - name: TURN_HOST
-              value: "coturn" # TURN server service name in Kubernetes
+              value: "coturn-lb" # Load-balanced TURN service (fallback)
+            - name: TURN_REPLICAS
+              value: "3" # Number of TURN server replicas for load distribution
             - name: TURN_USERNAME
               value: "webrtc"
             - name: TURN_PASSWORD
