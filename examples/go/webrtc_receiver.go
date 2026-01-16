@@ -8,52 +8,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/pion/webrtc/v3"
 )
 
 func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-}
-
-// logf is an alias for the simple logging function from pkg/logging
-var logf = logging.LogSimple
-
-type CreateTestRequest struct {
-	NumParticipants int         `json:"num_participants"`
-	Video           VideoConfig `json:"video"`
-	Audio           AudioConfig `json:"audio"`
-	DurationSeconds int         `json:"duration_seconds"`
-}
-
-type VideoConfig struct {
-	Width       int    `json:"width"`
-	Height      int    `json:"height"`
-	FPS         int    `json:"fps"`
-	BitrateKbps int    `json:"bitrate_kbps"`
-	Codec       string `json:"codec"`
-}
-
-type AudioConfig struct {
-	SampleRate  int    `json:"sample_rate"`
-	Channels    int    `json:"channels"`
-	BitrateKbps int    `json:"bitrate_kbps"`
-	Codec       string `json:"codec"`
-}
-
-type CreateTestResponse struct {
-	TestID       string `json:"test_id"`
-	Participants []struct {
-		ParticipantID uint32 `json:"participant_id"`
-	} `json:"participants"`
 }
 
 type SDPResponse struct {
@@ -65,541 +32,709 @@ type SDPAnswerRequest struct {
 	SDPAnswer string `json:"sdp_answer"`
 }
 
+type ParticipantConnection struct {
+	ID             uint32
+	PodName        string
+	PeerConnection *webrtc.PeerConnection
+	VideoPackets   atomic.Int64
+	AudioPackets   atomic.Int64
+	VideoBytes     atomic.Int64
+	AudioBytes     atomic.Int64
+	Connected      atomic.Bool
+}
+
+type PodInfo struct {
+	Name           string
+	PartitionID    int
+	Participants   []uint32
+	PortForwardCmd *exec.Cmd
+	LocalPort      int
+}
+
 func main() {
-	baseURL := "http://localhost:8080"
-	var existingTestID string
-	if len(os.Args) > 1 {
-		baseURL = os.Args[1]
-	}
-	if len(os.Args) > 2 {
-		existingTestID = os.Args[2]
-		log.Printf("Using existing test ID: %s", existingTestID)
-	}
-
-	transport := &http.Transport{
-		MaxIdleConns:       10,
-		IdleConnTimeout:    30 * time.Second,
-		DisableKeepAlives:  false,
-		DisableCompression: false,
-	}
-	httpClient := &http.Client{
-		Timeout:   60 * time.Second,
-		Transport: transport,
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: go run webrtc_receiver.go <base_url> <test_id> [max_connections]")
+		fmt.Println("")
+		fmt.Println("Examples:")
+		fmt.Println("  go run webrtc_receiver.go http://localhost:8080 chaos_test_123 all")
+		fmt.Println("  go run webrtc_receiver.go http://localhost:8080 chaos_test_123 100")
+		fmt.Println("  go run webrtc_receiver.go http://localhost:8080 chaos_test_123 1")
+		fmt.Println("")
+		fmt.Println("For Kubernetes mode, this will automatically:")
+		fmt.Println("  1. Discover all orchestrator pods")
+		fmt.Println("  2. Port-forward to each pod")
+		fmt.Println("  3. Connect to participants in each pod")
+		fmt.Println("")
+		fmt.Println("Use 'all' for max_connections to connect to all participants (default)")
+		fmt.Println("Use '1' for single participant mode (detailed logging)")
+		os.Exit(1)
 	}
 
-	var testID string
-	var participantID uint32
-	var foundParticipantID string
+	baseURL := os.Args[1]
+	testID := os.Args[2]
+	maxConnections := -1 // -1 means all participants
+	if len(os.Args) > 3 && os.Args[3] != "all" {
+		fmt.Sscanf(os.Args[3], "%d", &maxConnections)
+	}
 
-	// Step 1: Create test or use existing
-	if existingTestID != "" {
-		testID = existingTestID
-		log.Printf("Using existing test: %s", testID)
-
-		log.Printf("Checking server connectivity...")
-		maxHealthRetries := 3
-		var healthErr error
-		var healthResp *http.Response
-		for retry := 0; retry < maxHealthRetries; retry++ {
-			healthClient := &http.Client{
-				Timeout: 5 * time.Second,
-			}
-			healthResp, healthErr = healthClient.Get(fmt.Sprintf("%s/healthz", baseURL))
-			if healthErr == nil && healthResp.StatusCode == http.StatusOK {
-				healthResp.Body.Close()
-				log.Printf("✅ Server is reachable")
-				break
-			}
-			if healthErr != nil {
-				if retry < maxHealthRetries-1 {
-					log.Printf("⚠️  Attempt %d/%d: Cannot connect to server: %v, retrying in 2s...", retry+1, maxHealthRetries, healthErr)
-					time.Sleep(2 * time.Second)
-				} else {
-					log.Fatalf("❌ Cannot connect to server at %s after %d attempts: %v\n"+
-						"This usually means:\n"+
-						"  1. Port-forward is not active (run: kubectl port-forward svc/orchestrator 8080:8080)\n"+
-						"  2. Port-forward disconnected (restart it: pkill -f 'kubectl port-forward' && kubectl port-forward svc/orchestrator 8080:8080)\n"+
-						"  3. Server is not running\n"+
-						"  4. Wrong URL\n"+
-						"Quick fix: kubectl port-forward svc/orchestrator 8080:8080 &\n"+
-						"To check port-forward: ps aux | grep 'kubectl port-forward'\n"+
-						"To check pods: kubectl get pods -l app=orchestrator", baseURL, maxHealthRetries, healthErr)
-				}
-			} else {
-				healthResp.Body.Close()
-				if healthResp.StatusCode != http.StatusOK {
-					log.Fatalf("❌ Server health check failed (status %d)", healthResp.StatusCode)
-				}
-			}
-		}
-
-		// Skip test info check - go straight to finding a participant via SDP endpoint
-
-		// Try to find a participant that exists in the partition we're connected to
-		// Port-forward typically connects to orchestrator-0 (partition 0)
-		// Participants are assigned: participantID % totalPartitions == partitionID
-		// With 10 partitions, partition 0 gets: 1010, 1020, 1030, ... (IDs where ID % 10 == 0)
-		// Partition 1 gets: 1001, 1011, 1021, ... (IDs where ID % 10 == 1)
-		log.Printf("Trying to find a participant in the connected partition...")
-		found := false
-		maxRetries := 2
-
-		// Try participants that would be in partition 0 (the default port-forward target)
-		// These are participants where (participantID % 10) == 0
-		// Starting from 1010 (1010 % 10 = 0), then 1020, 1030, etc.
-		for offset := 0; offset < 10; offset++ {
-			tryID := uint32(1010 + offset*10) // 1010, 1020, 1030, ... (all in partition 0)
-			testURL := fmt.Sprintf("%s/api/v1/test/%s/sdp/%d", baseURL, testID, tryID)
-
-			for retry := 0; retry < maxRetries; retry++ {
-				testResp, err := httpClient.Get(testURL)
-				if err == nil {
-					if testResp.StatusCode == http.StatusOK {
-						foundParticipantID = fmt.Sprintf("%d", tryID)
-						found = true
-						log.Printf("✅ Found participant %s in connected partition", foundParticipantID)
-						testResp.Body.Close()
-						break
-					} else if testResp.StatusCode == http.StatusNotFound {
-						testResp.Body.Close()
-						break
-					} else {
-						log.Printf("⚠️  Participant %d returned status %d, trying next...", tryID, testResp.StatusCode)
-						testResp.Body.Close()
-						break
-					}
-				} else if retry < maxRetries-1 {
-					log.Printf("⚠️  Attempt %d/%d for participant %d failed: %v, retrying...", retry+1, maxRetries, tryID, err)
-					time.Sleep(500 * time.Millisecond)
-				} else {
-					log.Printf("❌ Participant %d failed after %d attempts: %v", tryID, maxRetries, err)
-				}
-			}
-			if found {
-				break
-			}
-			if !found {
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-
-		// If not found in partition 0, try other partitions (1-9)
-		// This handles cases where port-forward connects to a different pod
-		if !found {
-			log.Printf("No participants found in partition 0, trying other partitions...")
-			for partition := 1; partition < 10 && !found; partition++ {
-				// Try first participant in each partition
-				// Partition N gets participants where (ID % 10) == N
-				// So partition 1 gets 1001, 1011, 1021...
-				// Partition 2 gets 1002, 1012, 1022...
-				tryID := uint32(1001 + partition - 1) // 1001, 1002, 1003, ... for partitions 1-9
-				if partition == 0 {
-					tryID = 1010 // Partition 0 gets 1010, 1020, etc.
-				}
-				testURL := fmt.Sprintf("%s/api/v1/test/%s/sdp/%d", baseURL, testID, tryID)
-
-				for retry := 0; retry < maxRetries; retry++ {
-					testResp, err := httpClient.Get(testURL)
-					if err == nil {
-						if testResp.StatusCode == http.StatusOK {
-							foundParticipantID = fmt.Sprintf("%d", tryID)
-							found = true
-							log.Printf("✅ Found participant %s in partition %d", foundParticipantID, partition)
-							testResp.Body.Close()
-							break
-						}
-						testResp.Body.Close()
-					}
-					if retry < maxRetries-1 {
-						time.Sleep(500 * time.Millisecond)
-					}
-				}
-			}
-		}
-
-		if !found {
-			log.Fatalf("Failed to find any participant in any partition after trying all candidates.\n"+
-				"This usually means:\n"+
-				"  1. Port-forward is not active (run: kubectl port-forward svc/orchestrator 8080:8080)\n"+
-				"  2. Test %s does not exist or has no participants\n"+
-				"  3. The test was created with different participant IDs\n"+
-				"Try: Use the chaos-test tool to create a test with participants across all partitions", testID)
-		}
-
-		// Convert foundParticipantID string to uint32 for participantID
-		if foundParticipantID != "" {
-			if pid, err := strconv.ParseUint(foundParticipantID, 10, 32); err == nil {
-				participantID = uint32(pid)
-			} else {
-				log.Fatalf("Failed to parse participant ID: %s", foundParticipantID)
-			}
-		}
+	if maxConnections == -1 {
+		log.Printf("Connecting to ALL participants from test %s", testID)
+	} else if maxConnections == 1 {
+		log.Printf("Single participant mode - connecting to 1 participant from test %s", testID)
 	} else {
-		// Create new test
-		// In Kubernetes mode with partitions, create enough participants to ensure
-		// at least one is assigned to the partition handling the request
-		// Formula: participant_id % total_partitions == partition_id
-		// For 10 partitions, participant 1001 % 10 = 1, so it goes to partition 1
-		// Participant 1002 % 10 = 2, goes to partition 2, etc.
-		// Participant 1000 % 10 = 0, goes to partition 0
-		// So we create 10 participants to ensure at least one per partition
-		testReq := CreateTestRequest{
-			NumParticipants: 10, // Create enough to ensure at least one in each partition
-			Video: VideoConfig{
-				Width:       constants.DefaultWidth,
-				Height:      constants.DefaultHeight,
-				FPS:         constants.DefaultFPS,
-				BitrateKbps: constants.DefaultBitrateKbps,
-				Codec:       "h264",
-			},
-			Audio: AudioConfig{
-				SampleRate:  48000,
-				Channels:    1,
-				BitrateKbps: 128,
-				Codec:       "opus",
-			},
-			DurationSeconds: 600,
-		}
-
-		reqBody, _ := json.Marshal(testReq)
-		log.Printf("Creating test with %d participants...", testReq.NumParticipants)
-		resp, err := httpClient.Post(baseURL+"/api/v1/test/create", "application/json", bytes.NewBuffer(reqBody))
-		if err != nil {
-			log.Fatalf("Failed to create test: %v\n"+
-				"This may be due to:\n"+
-				"  1. Server not running or port-forward not active\n"+
-				"  2. Network connectivity issues\n"+
-				"  3. Request timeout (try increasing timeout or check server logs)", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusCreated {
-			body, _ := io.ReadAll(resp.Body)
-			log.Fatalf("Test creation failed with status %d: %s", resp.StatusCode, string(body))
-		}
-
-		var testResp CreateTestResponse
-		if err := json.NewDecoder(resp.Body).Decode(&testResp); err != nil {
-			log.Fatalf("Failed to decode response: %v", err)
-		}
-
-		if testResp.TestID == "" {
-			log.Fatalf("Test creation failed: no test ID in response")
-		}
-
-		if len(testResp.Participants) == 0 {
-			// In Kubernetes mode with partitions, the participant might be assigned to a different partition
-			// Participant assignment: participantID % totalPartitions == partitionID
-			// With 10 partitions: 1001 % 10 = 1 (partition 1), 1002 % 10 = 2 (partition 2), etc.
-			// Try to find a participant by querying metrics or use a known participant ID
-			log.Printf("Warning: No participants in response. This happens in Kubernetes mode when the participant is assigned to a different partition.")
-			log.Printf("Attempting to use participant ID 1001 (assigned to partition 1 in 10-partition mode)...")
-
-			// Use participant 1001 as default - it should exist if test was created
-			// In 10-partition mode: 1001 % 10 = 1, so it's in partition 1
-			// We'll try to get SDP from that participant
-			testResp.Participants = []struct {
-				ParticipantID uint32 `json:"participant_id"`
-			}{{ParticipantID: 1001}}
-			log.Printf("Using participant ID 1001. If this fails, ensure the test was created with enough participants.")
-		}
-
-		testID = testResp.TestID
-		participantID = testResp.Participants[0].ParticipantID
-		log.Printf("Created test: %s, Participant ID: %d", testID, participantID)
+		log.Printf("Connecting to up to %d participants from test %s", maxConnections, testID)
 	}
 
-	// Step 2: Get SDP offer
-	// In Kubernetes mode, we need to get SDP from the correct partition
-	sdpURL := fmt.Sprintf("%s/api/v1/test/%s/sdp/%d", baseURL, testID, participantID)
-	log.Printf("Getting SDP offer from: %s", sdpURL)
-	sdpResp, err := httpClient.Get(sdpURL)
+	// Check if we're in Kubernetes mode
+	kubectlCmd, err := exec.LookPath("kubectl")
+	kubernetesMode := err == nil
+
+	var pods []*PodInfo
+	var cleanupFuncs []func()
+
+	if kubernetesMode {
+		log.Printf("Kubernetes mode detected - will use kubectl port-forward")
+		pods, cleanupFuncs = setupKubernetesPods(kubectlCmd)
+		if len(pods) == 0 {
+			log.Fatal("No pods found or port-forward failed")
+		}
+		defer func() {
+			log.Printf("Cleaning up port-forwards...")
+			for _, cleanup := range cleanupFuncs {
+				cleanup()
+			}
+		}()
+	}
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	// Find and connect to participants
+	initialCap := 100
+	if maxConnections > 0 && maxConnections < initialCap {
+		initialCap = maxConnections
+	}
+	connections := make([]*ParticipantConnection, 0, initialCap)
+	var connMu sync.Mutex
+
+	if kubernetesMode {
+		// Connect to participants across all pods
+		var wg sync.WaitGroup
+
+		connectionsPerPod := maxConnections
+		if maxConnections > 0 {
+			connectionsPerPod = maxConnections / len(pods)
+			if connectionsPerPod == 0 {
+				connectionsPerPod = 1
+			}
+		}
+
+		log.Printf("Connecting to participants across %d pods (max per pod: %s)",
+			len(pods),
+			func() string {
+				if connectionsPerPod < 0 {
+					return "all"
+				}
+				return fmt.Sprintf("%d", connectionsPerPod)
+			}())
+
+		for _, pod := range pods {
+			wg.Add(1)
+			go func(p *PodInfo) {
+				defer wg.Done()
+				podURL := fmt.Sprintf("http://localhost:%d", p.LocalPort)
+				podConns := connectToPodParticipants(httpClient, podURL, testID, p, connectionsPerPod, maxConnections == 1)
+				connMu.Lock()
+				connections = append(connections, podConns...)
+				connMu.Unlock()
+				log.Printf("✅ Pod %s: Connected to %d participants", p.Name, len(podConns))
+			}(pod)
+		}
+		wg.Wait()
+	} else {
+		// Local mode - connect directly
+		participantIDs := findParticipants(httpClient, baseURL, testID, maxConnections)
+		if len(participantIDs) == 0 {
+			log.Fatal("No participants found")
+		}
+
+		var wg sync.WaitGroup
+		for _, participantID := range participantIDs {
+			wg.Add(1)
+			go func(pid uint32) {
+				defer wg.Done()
+				conn, err := connectToParticipant(httpClient, baseURL, testID, pid, "local", maxConnections == 1)
+				if err != nil {
+					log.Printf("Failed to connect to participant %d: %v", pid, err)
+					return
+				}
+				connMu.Lock()
+				connections = append(connections, conn)
+				connMu.Unlock()
+				log.Printf("✅ Connected to participant %d", pid)
+			}(participantID)
+			time.Sleep(100 * time.Millisecond)
+		}
+		wg.Wait()
+	}
+
+	log.Printf("Successfully connected to %d participants", len(connections))
+
+	if len(connections) == 0 {
+		log.Fatal("No successful connections")
+	}
+
+	// Print statistics periodically
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case <-ticker.C:
+			printStats(connections)
+		case <-sigChan:
+			log.Println("\nShutting down...")
+			// Cleanup connections
+			for _, conn := range connections {
+				if conn.PeerConnection != nil {
+					conn.PeerConnection.Close()
+				}
+			}
+			printStats(connections)
+			return
+		}
+	}
+}
+
+func setupKubernetesPods(kubectlCmd string) ([]*PodInfo, []func()) {
+	cmd := exec.Command(kubectlCmd, "get", "pods", "-l", "app=orchestrator", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	output, err := cmd.Output()
 	if err != nil {
-		log.Fatalf("Failed to get SDP offer: %v", err)
-	}
-	defer sdpResp.Body.Close()
-
-	if sdpResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(sdpResp.Body)
-		log.Fatalf("Failed to get SDP offer (status %d): %s\n"+
-			"This may happen if participant %d is in a different partition.\n"+
-			"In Kubernetes mode with 10 partitions:\n"+
-			"  - Participant 1001 is in partition 1 (1001 %% 10 = 1)\n"+
-			"  - Participant 1002 is in partition 2 (1002 %% 10 = 2)\n"+
-			"  - etc.\n"+
-			"Try accessing the orchestrator pod that has this participant, or create a test with 10+ participants.",
-			sdpResp.StatusCode, string(body), participantID)
+		log.Printf("Failed to get pods: %v", err)
+		return nil, nil
 	}
 
-	var sdpOfferResp SDPResponse
-	if err := json.NewDecoder(sdpResp.Body).Decode(&sdpOfferResp); err != nil {
-		log.Fatalf("Failed to decode SDP offer: %v", err)
+	podNames := []string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			podNames = append(podNames, line)
+		}
 	}
 
-	log.Printf("Received SDP offer")
-	if strings.Contains(sdpOfferResp.SDPOffer, "typ relay") {
-		log.Printf("✅ SDP offer contains TURN relay candidates")
-	} else {
-		log.Printf("⚠️  SDP offer does NOT contain TURN relay candidates - this may cause connection failures")
-		log.Printf("   This usually means TURN servers are not accessible from Kubernetes pods")
+	if len(podNames) == 0 {
+		log.Printf("No orchestrator pods found")
+		return nil, nil
 	}
 
-	// Step 3: Create WebRTC peer connection
-	log.Printf("🔌 Creating WebRTC peer connection...")
+	log.Printf("Found %d orchestrator pods", len(podNames))
 
-	// Get TURN server from environment or use default (localhost for docker-compose)
-	turnHost := os.Getenv("TURN_HOST")
-	if turnHost == "" {
-		turnHost = "localhost" // Default to localhost for docker-compose
+	pods := make([]*PodInfo, 0, len(podNames))
+	cleanupFuncs := make([]func(), 0, len(podNames))
+	basePort := 18080
+
+	for i, podName := range podNames {
+		localPort := basePort + i
+
+		partitionID := 0
+		if parts := strings.Split(podName, "-"); len(parts) > 1 {
+			fmt.Sscanf(parts[len(parts)-1], "%d", &partitionID)
+		}
+
+		log.Printf("Setting up port-forward for %s (partition %d) on localhost:%d", podName, partitionID, localPort)
+
+		pfCmd := exec.Command(kubectlCmd, "port-forward", fmt.Sprintf("pod/%s", podName), fmt.Sprintf("%d:8080", localPort))
+		if err := pfCmd.Start(); err != nil {
+			log.Printf("Failed to start port-forward for %s: %v", podName, err)
+			continue
+		}
+
+		time.Sleep(1 * time.Second)
+
+		testURL := fmt.Sprintf("http://localhost:%d/healthz", localPort)
+		resp, err := http.Get(testURL)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			log.Printf("Port-forward for %s not ready, skipping", podName)
+			pfCmd.Process.Kill()
+			continue
+		}
+		resp.Body.Close()
+
+		pod := &PodInfo{
+			Name:           podName,
+			PartitionID:    partitionID,
+			LocalPort:      localPort,
+			PortForwardCmd: pfCmd,
+		}
+		pods = append(pods, pod)
+
+		cleanupFuncs = append(cleanupFuncs, func() {
+			if pfCmd.Process != nil {
+				pfCmd.Process.Kill()
+			}
+		})
+
+		log.Printf("✅ Port-forward ready for %s on localhost:%d", podName, localPort)
 	}
-	turnUsername := os.Getenv("TURN_USERNAME")
-	if turnUsername == "" {
-		turnUsername = "webrtc" // Default username
+
+	return pods, cleanupFuncs
+}
+
+func connectToPodParticipants(client *http.Client, podURL, testID string, pod *PodInfo, maxCount int, verbose bool) []*ParticipantConnection {
+	participantIDs := findParticipantsInPod(client, podURL, testID, pod.PartitionID, maxCount)
+	if len(participantIDs) == 0 {
+		log.Printf("No participants found in pod %s", pod.Name)
+		return nil
 	}
-	turnPassword := os.Getenv("TURN_PASSWORD")
-	if turnPassword == "" {
-		turnPassword = "webrtc123" // Default password
+
+	log.Printf("Found %d participants in pod %s (partition %d)", len(participantIDs), pod.Name, pod.PartitionID)
+
+	connections := make([]*ParticipantConnection, 0, len(participantIDs))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, pid := range participantIDs {
+		wg.Add(1)
+		go func(participantID uint32) {
+			defer wg.Done()
+			conn, err := connectToParticipant(client, podURL, testID, participantID, pod.Name, verbose)
+			if err != nil {
+				log.Printf("Failed to connect to participant %d in pod %s: %v", participantID, pod.Name, err)
+				return
+			}
+			mu.Lock()
+			connections = append(connections, conn)
+			mu.Unlock()
+			log.Printf("✅ Connected to participant %d in pod %s", participantID, pod.Name)
+		}(pid)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	wg.Wait()
+	return connections
+}
+
+func findParticipantsInPod(client *http.Client, podURL, testID string, partitionID int, maxCount int) []uint32 {
+	metricsURL := fmt.Sprintf("%s/api/v1/test/%s/metrics", podURL, testID)
+	resp, err := client.Get(metricsURL)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		var metrics map[string]interface{}
+		if json.NewDecoder(resp.Body).Decode(&metrics) == nil {
+			if participants, ok := metrics["participants"].([]interface{}); ok {
+				participantIDs := make([]uint32, 0, len(participants))
+				for _, p := range participants {
+					if pMap, ok := p.(map[string]interface{}); ok {
+						if pid, ok := pMap["participant_id"].(float64); ok {
+							participantIDs = append(participantIDs, uint32(pid))
+							if maxCount > 0 && len(participantIDs) >= maxCount {
+								break
+							}
+						}
+					}
+				}
+				if len(participantIDs) > 0 {
+					return participantIDs
+				}
+			}
+		}
+	}
+
+	totalPartitions := 10
+	healthURL := fmt.Sprintf("%s/healthz", podURL)
+	if resp, err := client.Get(healthURL); err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		var health map[string]interface{}
+		if json.NewDecoder(resp.Body).Decode(&health) == nil {
+			if tp, ok := health["total_partitions"].(float64); ok {
+				totalPartitions = int(tp)
+			}
+		}
+	}
+
+	participantIDs := make([]uint32, 0)
+	baseID := uint32(1001)
+	searchLimit := 10000
+	if maxCount > 0 {
+		searchLimit = maxCount * totalPartitions * 2
+	}
+
+	log.Printf("Searching for participants in partition %d (totalPartitions=%d)", partitionID, totalPartitions)
+
+	checked := 0
+	found := 0
+
+	for i := 0; i < searchLimit; i++ {
+		candidateID := baseID + uint32(i)
+		if int(candidateID)%totalPartitions != partitionID {
+			continue
+		}
+		checked++
+
+		url := fmt.Sprintf("%s/api/v1/test/%s/sdp/%d", podURL, testID, candidateID)
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("Error checking participant %d: %v", candidateID, err)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			participantIDs = append(participantIDs, candidateID)
+			found++
+			log.Printf("✓ Found participant %d in partition %d", candidateID, partitionID)
+			if maxCount > 0 && len(participantIDs) >= maxCount {
+				resp.Body.Close()
+				break
+			}
+		} else if resp.StatusCode != http.StatusNotFound {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Unexpected status %d for participant %d: %s", resp.StatusCode, candidateID, string(body))
+		}
+		resp.Body.Close()
+
+		if found == 0 && checked > 100 {
+			log.Printf("Checked %d candidates in partition %d, found none. Stopping search.", checked, partitionID)
+			break
+		}
+	}
+
+	log.Printf("Found %d participants for partition %d (checked %d candidates)", len(participantIDs), partitionID, checked)
+	return participantIDs
+}
+
+func findParticipants(client *http.Client, baseURL, testID string, maxCount int) []uint32 {
+	metricsURL := fmt.Sprintf("%s/api/v1/test/%s/metrics", baseURL, testID)
+	resp, err := client.Get(metricsURL)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		var metrics map[string]interface{}
+		if json.NewDecoder(resp.Body).Decode(&metrics) == nil {
+			if participants, ok := metrics["participants"].([]interface{}); ok {
+				participantIDs := make([]uint32, 0, len(participants))
+				for _, p := range participants {
+					if pMap, ok := p.(map[string]interface{}); ok {
+						if pid, ok := pMap["participant_id"].(float64); ok {
+							participantIDs = append(participantIDs, uint32(pid))
+							if maxCount > 0 && len(participantIDs) >= maxCount {
+								break
+							}
+						}
+					}
+				}
+				if len(participantIDs) > 0 {
+					return participantIDs
+				}
+			}
+		}
+	}
+
+	searchRange := maxCount * 20
+	if maxCount < 0 {
+		searchRange = 10000
+	}
+
+	participantIDs := make([]uint32, 0)
+	for i := 0; i < searchRange; i++ {
+		if maxCount > 0 && len(participantIDs) >= maxCount {
+			break
+		}
+		pid := uint32(1001 + i)
+		url := fmt.Sprintf("%s/api/v1/test/%s/sdp/%d", baseURL, testID, pid)
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			participantIDs = append(participantIDs, pid)
+		}
+		resp.Body.Close()
+	}
+	return participantIDs
+}
+
+func connectToParticipant(client *http.Client, baseURL, testID string, participantID uint32, podName string, verbose bool) (*ParticipantConnection, error) {
+	sdpURL := fmt.Sprintf("%s/api/v1/test/%s/sdp/%d", baseURL, testID, participantID)
+	resp, err := client.Get(sdpURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get SDP: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("SDP request failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var sdpResp SDPResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sdpResp); err != nil {
+		return nil, fmt.Errorf("failed to decode SDP: %w", err)
 	}
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 			{URLs: []string{"stun:stun1.l.google.com:19302"}},
-			// Local TURN server (coturn in docker-compose)
-			{URLs: []string{fmt.Sprintf("turn:%s:3478", turnHost)}, Username: turnUsername, Credential: turnPassword},
-			{URLs: []string{fmt.Sprintf("turn:%s:3478?transport=tcp", turnHost)}, Username: turnUsername, Credential: turnPassword},
-			// Fallback to public TURN servers if local server is not available
-			{URLs: []string{"turn:openrelay.metered.ca:80"}, Username: "openrelayproject", Credential: "openrelayproject"},
-			{URLs: []string{"turn:openrelay.metered.ca:443"}, Username: "openrelayproject", Credential: "openrelayproject"},
 		},
-		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 	}
 
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		return nil, fmt.Errorf("failed to register codecs: %w", err)
+	}
+
+	settingEngine := webrtc.SettingEngine{}
+	settingEngine.SetICETimeouts(10*time.Second, 30*time.Second, 5*time.Second)
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(mediaEngine),
+		webrtc.WithSettingEngine(settingEngine),
+	)
+	pc, err := api.NewPeerConnection(config)
 	if err != nil {
-		log.Fatalf("Failed to create peer connection: %v", err)
-	}
-	defer peerConnection.Close()
-
-	var packetStatsMu sync.Mutex
-	packetStats := make(map[string]int)
-	lastLogTime := time.Now()
-	var lastLogTimeMu sync.Mutex
-
-	connectedParticipantID := foundParticipantID
-	if connectedParticipantID == "" {
-		connectedParticipantID = "unknown"
+		return nil, fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	conn := &ParticipantConnection{
+		ID:             participantID,
+		PodName:        podName,
+		PeerConnection: pc,
+	}
+
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		kind := track.Kind().String()
-		log.Printf("✅ Received %s track, SSRC: %d", kind, track.SSRC())
-		log.Printf("📡 REAL MEDIA STREAM - Receiving %s packets via WebRTC", kind)
-		log.Printf("💡 This is a REAL WebRTC connection with actual RTP packets, not a simulation!")
-
-		// Read RTP packets
-		packetCount := 0
+		if verbose {
+			log.Printf("Participant %d: Received %s track", participantID, kind)
+		}
 		for {
-			rtpPacket, _, err := track.ReadRTP()
+			pkt, _, err := track.ReadRTP()
 			if err != nil {
-				if err == io.EOF {
-					log.Printf("Track %s ended (EOF)", kind)
-					return
+				return
+			}
+			if kind == "video" {
+				conn.VideoPackets.Add(1)
+				conn.VideoBytes.Add(int64(len(pkt.Payload)))
+				if verbose && conn.VideoPackets.Load()%100 == 0 {
+					log.Printf("Participant %d: Video packet %d", participantID, conn.VideoPackets.Load())
 				}
-				log.Printf("Error reading RTP: %v", err)
-				continue
-			}
-
-			packetCount++
-
-			packetStatsMu.Lock()
-			packetStats[kind] = packetCount
-			packetStatsMu.Unlock()
-
-			// Extract participant ID - use the participant we connected to
-			// WebRTC may rewrite SSRC and strip custom extensions, so we use the known participant ID
-			participantID := connectedParticipantID
-			if packetCount%100 == 0 || packetCount <= 10 {
-				log.Printf("📦 [%s] Packet #%d | Participant: %s | Seq: %d | TS: %d | Payload: %d bytes | SSRC: %d",
-					kind, packetCount, participantID, rtpPacket.SequenceNumber, rtpPacket.Timestamp,
-					len(rtpPacket.Payload), rtpPacket.SSRC)
-			}
-
-			lastLogTimeMu.Lock()
-			shouldLog := time.Since(lastLogTime) >= 5*time.Second
-			if shouldLog {
-				lastLogTime = time.Now()
-			}
-			lastLogTimeMu.Unlock()
-
-			if shouldLog {
-				packetStatsMu.Lock()
-				totalPackets := 0
-				videoCount := packetStats["video"]
-				audioCount := packetStats["audio"]
-				for _, count := range packetStats {
-					totalPackets += count
-				}
-				packetStatsMu.Unlock()
-				log.Printf("📊 Media Statistics: Total packets received: %d (Video: %d, Audio: %d)",
-					totalPackets, videoCount, audioCount)
-			}
-		}
-	})
-
-	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("🔌 ICE Connection State: %s", state.String())
-		if state == webrtc.ICEConnectionStateFailed {
-			log.Printf("❌ ICE connection failed. This may be due to:")
-			log.Printf("   1. Network connectivity issues")
-			log.Printf("   2. Firewall blocking UDP traffic")
-			log.Printf("   3. STUN server unreachable")
-			log.Printf("   4. Server-side WebRTC not fully implemented (SDP only)")
-		} else if state == webrtc.ICEConnectionStateConnected {
-			log.Printf("✅ ICE connection established! Receiving real media packets...")
-		}
-	})
-
-	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate != nil {
-			candidateStr := candidate.String()
-			candidateJSON := candidate.ToJSON()
-
-			// Detect candidate type for better logging
-			candidateType := "unknown"
-			if strings.Contains(candidateJSON.Candidate, "typ host") {
-				candidateType = "host"
-			} else if strings.Contains(candidateJSON.Candidate, "typ srflx") {
-				candidateType = "srflx"
-			} else if strings.Contains(candidateJSON.Candidate, "typ relay") {
-				candidateType = "relay"
-				log.Printf("🧊 ICE Candidate: %s [%s] ✅ TURN relay candidate!", candidateStr, candidateType)
 			} else {
-				log.Printf("🧊 ICE Candidate: %s [%s]", candidateStr, candidateType)
+				conn.AudioPackets.Add(1)
+				conn.AudioBytes.Add(int64(len(pkt.Payload)))
 			}
-
-			// Send ICE candidate to server
-			go func() {
-				candidateReq := map[string]interface{}{
-					"candidate":     candidateJSON.Candidate,
-					"sdpMLineIndex": candidateJSON.SDPMLineIndex,
-					"sdpMid":        candidateJSON.SDPMid,
-				}
-				candidateBody, _ := json.Marshal(candidateReq)
-
-				maxRetries := 2
-				for retry := 0; retry < maxRetries; retry++ {
-					candidateResp, err := httpClient.Post(
-						fmt.Sprintf("%s/api/v1/test/%s/ice/%d", baseURL, testID, participantID),
-						"application/json",
-						bytes.NewBuffer(candidateBody),
-					)
-					if err == nil {
-						candidateResp.Body.Close()
-						if candidateType == "relay" {
-							log.Printf("✅ Sent TURN relay candidate to server")
-						} else {
-							log.Printf("✅ Sent ICE candidate to server")
-						}
-						return
-					}
-					if retry < maxRetries-1 {
-						time.Sleep(500 * time.Millisecond)
-					} else {
-						log.Printf("⚠️  Failed to send ICE candidate to server after %d attempts: %v (non-critical)", maxRetries, err)
-					}
-				}
-			}()
-		} else {
-			log.Printf("🧊 ICE gathering complete")
 		}
 	})
 
-	// Set remote description (SDP offer)
+	connected := make(chan bool, 1)
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		if verbose {
+			log.Printf("Participant %d: ICE state: %s", participantID, state.String())
+		}
+		if state == webrtc.ICEConnectionStateConnected {
+			conn.Connected.Store(true)
+			select {
+			case connected <- true:
+			default:
+			}
+		} else if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateDisconnected {
+			conn.Connected.Store(false)
+		}
+	})
+
 	offer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
-		SDP:  sdpOfferResp.SDPOffer,
+		SDP:  sdpResp.SDPOffer,
 	}
 
-	if err := peerConnection.SetRemoteDescription(offer); err != nil {
-		log.Fatalf("Failed to set remote description: %v", err)
+	if verbose {
+		hasOfferUfrag := strings.Contains(sdpResp.SDPOffer, "a=ice-ufrag:")
+		hasOfferPwd := strings.Contains(sdpResp.SDPOffer, "a=ice-pwd:")
+		log.Printf("Participant %d: Offer has ice-ufrag=%v, ice-pwd=%v", participantID, hasOfferUfrag, hasOfferPwd)
 	}
 
-	// Create answer
-	answer, err := peerConnection.CreateAnswer(nil)
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
-		log.Fatalf("Failed to create answer: %v", err)
+		pc.Close()
+		return nil, fmt.Errorf("failed to create answer: %w", err)
 	}
 
-	if err := peerConnection.SetLocalDescription(answer); err != nil {
-		log.Fatalf("Failed to set local description: %v", err)
+	if err := pc.SetLocalDescription(answer); err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("failed to set local description: %w", err)
 	}
 
-	log.Printf("Created SDP answer")
-
-	// Step 4: Send SDP answer back (with retry logic)
-	log.Printf("Sending SDP answer to server...")
-	answerReq := SDPAnswerRequest{
-		SDPAnswer: answer.SDP,
-	}
-
-	answerBody, _ := json.Marshal(answerReq)
-
-	maxRetries := 3
-	var answerResp *http.Response
-	var answerErr error
-	for retry := 0; retry < maxRetries; retry++ {
-		answerResp, answerErr = httpClient.Post(
-			fmt.Sprintf("%s/api/v1/test/%s/answer/%d", baseURL, testID, participantID),
-			"application/json",
-			bytes.NewBuffer(answerBody),
-		)
-		if answerErr == nil && answerResp.StatusCode == http.StatusOK {
-			break
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	select {
+	case <-gatherComplete:
+		if verbose {
+			log.Printf("Participant %d: ICE gathering complete", participantID)
 		}
-		if answerErr != nil {
-			if retry < maxRetries-1 {
-				log.Printf("⚠️  Attempt %d/%d: Failed to send SDP answer: %v, retrying in 2s...", retry+1, maxRetries, answerErr)
-				time.Sleep(2 * time.Second)
-			} else {
-				log.Fatalf("❌ Failed to send SDP answer after %d attempts: %v", maxRetries, answerErr)
-			}
-		} else {
-			answerResp.Body.Close()
-			if answerResp.StatusCode != http.StatusOK {
-				log.Printf("⚠️  Server returned status %d, retrying...", answerResp.StatusCode)
-				time.Sleep(2 * time.Second)
-			}
-		}
+	case <-time.After(10 * time.Second):
+		log.Printf("Participant %d: ICE gathering timeout (continuing anyway)", participantID)
 	}
-	if answerErr != nil {
-		log.Fatalf("❌ Failed to send SDP answer: %v", answerErr)
+
+	finalAnswer := pc.LocalDescription()
+	if finalAnswer == nil {
+		pc.Close()
+		return nil, fmt.Errorf("local description is nil after ICE gathering")
+	}
+
+	hasUfrag := strings.Contains(finalAnswer.SDP, "a=ice-ufrag:")
+	hasPwd := strings.Contains(finalAnswer.SDP, "a=ice-pwd:")
+	if !hasUfrag || !hasPwd {
+		log.Printf("Participant %d: ERROR - SDP missing ICE credentials!", participantID)
+		pc.Close()
+		return nil, fmt.Errorf("SDP answer missing ICE credentials")
+	}
+
+	answerReq := SDPAnswerRequest{SDPAnswer: finalAnswer.SDP}
+	answerBody, err := json.Marshal(answerReq)
+	if err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("failed to marshal answer: %w", err)
+	}
+	answerURL := fmt.Sprintf("%s/api/v1/test/%s/answer/%d", baseURL, testID, participantID)
+	answerResp, err := client.Post(answerURL, "application/json", bytes.NewBuffer(answerBody))
+	if err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("failed to send answer: %w", err)
 	}
 	defer answerResp.Body.Close()
 
 	if answerResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(answerResp.Body)
-		log.Fatalf("❌ Server returned error (status %d): %s", answerResp.StatusCode, string(body))
+		pc.Close()
+		return nil, fmt.Errorf("answer request failed: %d - %s", answerResp.StatusCode, string(body))
 	}
 
-	log.Printf("✅ SDP answer sent successfully, waiting for media...")
+	log.Printf("Participant %d: Answer accepted by server", participantID)
 
-	// Step 5: Start test (only if we created a new test, not for existing tests)
-	if existingTestID == "" {
-		startResp, err := httpClient.Post(fmt.Sprintf("%s/api/v1/test/%s/start", baseURL, testID), "application/json", nil)
-		if err != nil {
-			log.Printf("⚠️  Failed to start test (may already be running): %v", err)
-		} else {
-			defer startResp.Body.Close()
-			log.Printf("Test started, receiving media...")
+	select {
+	case <-connected:
+		return conn, nil
+	case <-time.After(15 * time.Second):
+		log.Printf("⚠️  Participant %d: ICE connection slow (continuing anyway)", participantID)
+		return conn, nil
+	}
+}
+
+func printStats(connections []*ParticipantConnection) {
+	if len(connections) == 0 {
+		log.Println("\n═══════════════════════════════════════════════════════════")
+		log.Println("                    WEBRTC RECEIVER STATS                   ")
+		log.Println("═══════════════════════════════════════════════════════════")
+		log.Println("No connections to display")
+		log.Println("═══════════════════════════════════════════════════════════\n")
+		return
+	}
+
+	var totalVideo, totalAudio int64
+	var totalVideoBytes, totalAudioBytes int64
+	activeConns := 0
+	connectedConns := 0
+
+	podStats := make(map[string]struct {
+		count        int
+		connected    int
+		videoPackets int64
+		audioPackets int64
+		videoBytes   int64
+		audioBytes   int64
+	})
+
+	type participantStat struct {
+		ID           uint32
+		PodName      string
+		VideoPackets int64
+		AudioPackets int64
+		TotalPackets int64
+	}
+	participantStats := make([]participantStat, 0, len(connections))
+
+	log.Println("\n═══════════════════════════════════════════════════════════")
+	log.Println("                    WEBRTC RECEIVER STATS                   ")
+	log.Println("═══════════════════════════════════════════════════════════")
+
+	for _, conn := range connections {
+		video := conn.VideoPackets.Load()
+		audio := conn.AudioPackets.Load()
+		videoBytes := conn.VideoBytes.Load()
+		audioBytes := conn.AudioBytes.Load()
+		connected := conn.Connected.Load()
+
+		totalVideo += video
+		totalAudio += audio
+		totalVideoBytes += videoBytes
+		totalAudioBytes += audioBytes
+
+		if video > 0 || audio > 0 {
+			activeConns++
+			participantStats = append(participantStats, participantStat{
+				ID:           conn.ID,
+				PodName:      conn.PodName,
+				VideoPackets: video,
+				AudioPackets: audio,
+				TotalPackets: video + audio,
+			})
 		}
-	} else {
-		log.Printf("Using existing test %s, skipping start (test should already be running)", testID)
+		if connected {
+			connectedConns++
+		}
+
+		stats := podStats[conn.PodName]
+		stats.count++
+		stats.videoPackets += video
+		stats.audioPackets += audio
+		stats.videoBytes += videoBytes
+		stats.audioBytes += audioBytes
+		if connected {
+			stats.connected++
+		}
+		podStats[conn.PodName] = stats
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	totalConns := len(connections)
+	log.Printf("\n--- Overall Summary ---")
+	log.Printf("Total Participants: %d", totalConns)
+	if totalConns > 0 {
+		log.Printf("  Connected: %d (%.1f%%)", connectedConns, float64(connectedConns)*100/float64(totalConns))
+		log.Printf("  Active (receiving data): %d (%.1f%%)", activeConns, float64(activeConns)*100/float64(totalConns))
+	}
+	log.Printf("")
+	log.Printf("Total Packets: %d", totalVideo+totalAudio)
+	log.Printf("  Video: %d packets (%.2f MB)", totalVideo, float64(totalVideoBytes)/1024/1024)
+	log.Printf("  Audio: %d packets (%.2f MB)", totalAudio, float64(totalAudioBytes)/1024/1024)
+	log.Printf("  Total Data: %.2f MB", float64(totalVideoBytes+totalAudioBytes)/1024/1024)
 
-	log.Println("Shutting down...")
+	log.Println("\n--- Per-Pod Summary ---")
+	for podName, stats := range podStats {
+		log.Printf("Pod %s:", podName)
+		log.Printf("  Participants: %d/%d connected", stats.connected, stats.count)
+		log.Printf("  Video: %d packets (%.2f MB)", stats.videoPackets, float64(stats.videoBytes)/1024/1024)
+		log.Printf("  Audio: %d packets (%.2f MB)", stats.audioPackets, float64(stats.audioBytes)/1024/1024)
+	}
+
+	for i := 0; i < len(participantStats) && i < 10; i++ {
+		for j := i + 1; j < len(participantStats); j++ {
+			if participantStats[j].TotalPackets > participantStats[i].TotalPackets {
+				participantStats[i], participantStats[j] = participantStats[j], participantStats[i]
+			}
+		}
+	}
+
+	if len(participantStats) > 0 {
+		log.Println("\n--- Top 10 Participants by Packet Count ---")
+		for i := 0; i < len(participantStats) && i < 10; i++ {
+			p := participantStats[i]
+			log.Printf("  Participant %d [%s]: %d total packets (Video: %d, Audio: %d)",
+				p.ID, p.PodName, p.TotalPackets, p.VideoPackets, p.AudioPackets)
+		}
+	}
+
+	log.Println("═══════════════════════════════════════════════════════════\n")
 }
