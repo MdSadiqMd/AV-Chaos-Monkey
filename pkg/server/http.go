@@ -241,15 +241,21 @@ func (s *HTTPServer) handleCreateTest(w http.ResponseWriter, r *http.Request) {
 
 	udpTargetHost := os.Getenv("UDP_TARGET_HOST")
 	udpTargetPort := getEnvInt("UDP_TARGET_PORT", 0)
+	inKubernetes := os.Getenv("KUBERNETES_SERVICE_HOST") != ""
+
 	if udpTargetHost != "" && udpTargetPort > 0 {
 		participantPool.SetTarget(udpTargetHost, udpTargetPort)
-		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d", udpTargetHost, udpTargetPort)
+		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d (explicit)", udpTargetHost, udpTargetPort)
+	} else if inKubernetes {
+		// when using Kubernetes, use udp-relay service to aggregate packets from all pods
+		participantPool.SetTarget("udp-relay", 5000)
+		log.Printf("[HTTP] UDP transmission enabled: target=udp-relay:5000 (Kubernetes mode)")
 	} else if udpTargetPort > 0 {
-		// If only port is set, use localhost
 		participantPool.SetTarget(constants.DefaultTargetHost, udpTargetPort)
-		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d", constants.DefaultTargetHost, udpTargetPort)
+		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d (port only)", constants.DefaultTargetHost, udpTargetPort)
 	} else {
-		log.Printf("[HTTP] UDP transmission disabled (set UDP_TARGET_HOST and UDP_TARGET_PORT to enable)")
+		participantPool.SetTarget(constants.DefaultTargetHost, constants.DefaultTargetPort)
+		log.Printf("[HTTP] UDP transmission enabled: target=%s:%d (default)", constants.DefaultTargetHost, constants.DefaultTargetPort)
 	}
 
 	basePort := 5000

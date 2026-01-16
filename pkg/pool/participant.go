@@ -641,8 +641,8 @@ func (p *VirtualParticipant) runVideoLoop() {
 	defer ticker.Stop()
 
 	totalFrames := p.mediaSource.GetTotalVideoFrames()
-	log.Printf("[Participant %d] Starting video stream: %d frames at %dfps (duration=%.1fs)",
-		p.ID, totalFrames, fps, float64(totalFrames)/float64(fps))
+	log.Printf("[Participant %d] Starting video stream: %d frames at %dfps (looping)",
+		p.ID, totalFrames, fps)
 
 	for range ticker.C {
 		if !p.active.Load() {
@@ -659,9 +659,14 @@ func (p *VirtualParticipant) runVideoLoop() {
 		// Get next NAL unit from media source (returns nil when media ends)
 		nal := p.mediaSource.GetVideoNAL(p.videoFrameIdx)
 		if nal == nil || len(nal.Data) == 0 {
-			// End of media reached
-			log.Printf("[Participant %d] Video stream complete: sent %d frames", p.ID, p.videoFrameIdx)
-			return
+			// Loop back to beginning when media ends
+			p.videoFrameIdx = 0
+			nal = p.mediaSource.GetVideoNAL(p.videoFrameIdx)
+			if nal == nil || len(nal.Data) == 0 {
+				// Fall back to synthetic frames if still no data
+				go p.runFrameLoop()
+				return
+			}
 		}
 
 		// Packetize NAL unit
@@ -705,8 +710,8 @@ func (p *VirtualParticipant) runAudioLoop() {
 	defer ticker.Stop()
 
 	totalFrames := p.mediaSource.GetTotalAudioFrames()
-	log.Printf("[Participant %d] Starting audio stream: %d frames (duration=%.1fs)",
-		p.ID, totalFrames, float64(totalFrames)*float64(constants.OpusFrameDuration)/1000.0)
+	log.Printf("[Participant %d] Starting audio stream: %d frames (looping)",
+		p.ID, totalFrames)
 
 	for range ticker.C {
 		if !p.active.Load() {
@@ -716,9 +721,13 @@ func (p *VirtualParticipant) runAudioLoop() {
 		// Get next audio packet from media source (returns nil when media ends)
 		packet := p.mediaSource.GetAudioPacket(p.audioFrameIdx)
 		if packet == nil || len(packet.Data) == 0 {
-			// End of media reached
-			log.Printf("[Participant %d] Audio stream complete: sent %d frames", p.ID, p.audioFrameIdx)
-			return
+			// Loop back to beginning when media ends
+			p.audioFrameIdx = 0
+			packet = p.mediaSource.GetAudioPacket(p.audioFrameIdx)
+			if packet == nil || len(packet.Data) == 0 {
+				// No audio available, stop audio streaming
+				return
+			}
 		}
 
 		// Create RTP packet for audio

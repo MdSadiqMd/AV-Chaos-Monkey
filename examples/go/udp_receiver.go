@@ -82,15 +82,16 @@ func parseRTPPacket(data []byte) (*RTPHeader, error) {
 }
 
 type PacketStats struct {
-	VideoPackets int
-	AudioPackets int
-	OtherPackets int
-	TotalBytes   int64
-	VideoBytes   int64
-	AudioBytes   int64
-	NALTypes     map[byte]int
-	UniqueSSRCs  map[uint32]bool
-	StartTime    time.Time
+	VideoPackets       int
+	AudioPackets       int
+	OtherPackets       int
+	TotalBytes         int64
+	VideoBytes         int64
+	AudioBytes         int64
+	NALTypes           map[byte]int
+	UniqueSSRCs        map[uint32]bool
+	ParticipantPackets map[uint32]int // Packets per participant
+	StartTime          time.Time
 }
 
 func main() {
@@ -125,9 +126,10 @@ func main() {
 
 	// Initialize stats
 	stats := &PacketStats{
-		NALTypes:    make(map[byte]int),
-		UniqueSSRCs: make(map[uint32]bool),
-		StartTime:   time.Now(),
+		NALTypes:           make(map[byte]int),
+		UniqueSSRCs:        make(map[uint32]bool),
+		ParticipantPackets: make(map[uint32]int),
+		StartTime:          time.Now(),
 	}
 
 	go func() {
@@ -154,6 +156,11 @@ func main() {
 
 		// Track unique SSRCs (participants)
 		stats.UniqueSSRCs[header.SSRC] = true
+
+		// Track packets per participant
+		if header.ParticipantID > 0 {
+			stats.ParticipantPackets[header.ParticipantID]++
+		}
 
 		// Track packet types
 		switch header.PayloadType {
@@ -227,7 +234,36 @@ func printStats(stats *PacketStats, totalPackets int) {
 	}
 	log.Println()
 	log.Printf("Unique Streams (SSRCs): %d", len(stats.UniqueSSRCs))
+	log.Printf("Unique Participants: %d", len(stats.ParticipantPackets))
 	log.Println()
+
+	// Show top 10 participants by packet count
+	type participantStat struct {
+		ID      uint32
+		Packets int
+	}
+	participants := make([]participantStat, 0, len(stats.ParticipantPackets))
+	for id, count := range stats.ParticipantPackets {
+		participants = append(participants, participantStat{ID: id, Packets: count})
+	}
+
+	// Sort by packet count (simple bubble sort for top 10)
+	for i := 0; i < len(participants) && i < 10; i++ {
+		for j := i + 1; j < len(participants); j++ {
+			if participants[j].Packets > participants[i].Packets {
+				participants[i], participants[j] = participants[j], participants[i]
+			}
+		}
+	}
+
+	if len(participants) > 0 {
+		log.Println("Top 10 Participants by Packet Count:")
+		for i := 0; i < len(participants) && i < 10; i++ {
+			log.Printf("  Participant %d: %d packets", participants[i].ID, participants[i].Packets)
+		}
+		log.Println()
+	}
+
 	log.Println("H.264 NAL Unit Types:")
 	for nalType, count := range stats.NALTypes {
 		log.Printf("  %s (type %d): %d packets", getNALTypeName(nalType), nalType, count)
