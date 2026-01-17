@@ -140,11 +140,6 @@ func NewParticipant(id uint32, config VideoConfig) (*VirtualParticipant, error) 
 	// Create peer connection config with real ICE servers
 	// Note: For Kubernetes deployments, TURN servers are essential for NAT traversal
 	// The STUN servers help with discovery, but TURN is needed for relay when both peers are behind NAT
-	// Get TURN server from environment or use default
-	turnHost := os.Getenv("TURN_HOST")
-	if turnHost == "" {
-		turnHost = "coturn"
-	}
 	turnUsername := os.Getenv("TURN_USERNAME")
 	if turnUsername == "" {
 		turnUsername = "webrtc"
@@ -154,17 +149,59 @@ func NewParticipant(id uint32, config VideoConfig) (*VirtualParticipant, error) 
 		turnPassword = "webrtc123"
 	}
 
+	// Build ICE servers list using only coturn STUN/TURN servers
+	// Check for multi-TURN setup (coturn StatefulSet with headless service)
+	// Each participant connects to a specific TURN server based on their ID
+
+	// Auto-detect TURN replicas: default to 3, can be overridden by env var
+	// For high participant counts, scale TURN servers: ~500 participants per server
+	turnReplicas := 3
+	if replicas := os.Getenv("TURN_REPLICAS"); replicas != "" {
+		fmt.Sscanf(replicas, "%d", &turnReplicas)
+	}
+	if turnReplicas < 1 {
+		turnReplicas = 1
+	}
+
+	// Determine which TURN server this participant should use (load balancing)
+	turnIndex := int(id) % turnReplicas
+	primaryTurnHost := fmt.Sprintf("coturn-%d.coturn.default.svc.cluster.local", turnIndex)
+
+	// Start with coturn STUN server
+	iceServers := []pionwebrtc.ICEServer{
+		{URLs: []string{fmt.Sprintf("stun:%s:3478", primaryTurnHost)}},
+	}
+
+	// Add primary TURN server for this participant
+	iceServers = append(iceServers,
+		pionwebrtc.ICEServer{URLs: []string{fmt.Sprintf("turn:%s:3478", primaryTurnHost)}, Username: turnUsername, Credential: turnPassword},
+		pionwebrtc.ICEServer{URLs: []string{fmt.Sprintf("turn:%s:3478?transport=tcp", primaryTurnHost)}, Username: turnUsername, Credential: turnPassword},
+	)
+
+	// Add other TURN servers as fallback (round-robin order starting from primary)
+	for i := 1; i < turnReplicas; i++ {
+		fallbackIndex := (turnIndex + i) % turnReplicas
+		fallbackHost := fmt.Sprintf("coturn-%d.coturn.default.svc.cluster.local", fallbackIndex)
+		iceServers = append(iceServers,
+			pionwebrtc.ICEServer{URLs: []string{fmt.Sprintf("turn:%s:3478", fallbackHost)}, Username: turnUsername, Credential: turnPassword},
+		)
+	}
+
+	// Also add load-balanced service as fallback
+	turnHost := os.Getenv("TURN_HOST")
+	if turnHost == "" {
+		turnHost = "coturn-lb" // Load-balanced service
+	}
+	iceServers = append(iceServers,
+		pionwebrtc.ICEServer{URLs: []string{fmt.Sprintf("stun:%s:3478", turnHost)}},
+		pionwebrtc.ICEServer{URLs: []string{fmt.Sprintf("turn:%s:3478", turnHost)}, Username: turnUsername, Credential: turnPassword},
+		pionwebrtc.ICEServer{URLs: []string{fmt.Sprintf("turn:%s:3478?transport=tcp", turnHost)}, Username: turnUsername, Credential: turnPassword},
+	)
+
+	log.Printf("[WebRTC] Participant %d: Using primary TURN server %s (index %d of %d)", id, primaryTurnHost, turnIndex, turnReplicas)
+
 	pcConfig := pionwebrtc.Configuration{
-		ICEServers: []pionwebrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-			{URLs: []string{"stun:stun1.l.google.com:19302"}},
-			// Local TURN server (coturn in docker-compose or Kubernetes)
-			{URLs: []string{fmt.Sprintf("turn:%s:3478", turnHost)}, Username: turnUsername, Credential: turnPassword},
-			{URLs: []string{fmt.Sprintf("turn:%s:3478?transport=tcp", turnHost)}, Username: turnUsername, Credential: turnPassword},
-			// Fallback to public TURN servers if local server is not available
-			{URLs: []string{"turn:openrelay.metered.ca:80"}, Username: "openrelayproject", Credential: "openrelayproject"},
-			{URLs: []string{"turn:openrelay.metered.ca:443"}, Username: "openrelayproject", Credential: "openrelayproject"},
-		},
+		ICEServers: iceServers,
 		// Use ICETransportPolicyAll to try all candidates (host, srflx, relay)
 		// If TURN is not accessible, connection will fail (expected in Kubernetes without proper TURN)
 		ICETransportPolicy: pionwebrtc.ICETransportPolicyAll,

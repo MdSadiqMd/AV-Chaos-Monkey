@@ -455,8 +455,10 @@ func deployK8s(projectRoot string) error {
 }
 
 func waitForPods(replicas int) error {
-	logInfo("Waiting for all %d orchestrator pods...", replicas)
+	logInfo("Waiting for orchestrator pods (need at least %d/%d)...", (replicas*8+9)/10, replicas)
 	kubectlCmd, _ := utils.FindCommand("kubectl")
+
+	minRequired := max((replicas*8+9)/10, 1) // 80% of replicas, rounded up
 
 	maxWait := 60
 	waited := 0
@@ -473,15 +475,22 @@ func waitForPods(replicas int) error {
 				pending++
 			}
 		}
+		// Proceed if we have enough pods (80%+) or all requested
 		if running >= replicas {
 			fmt.Println()
 			logSuccess("All %d pods ready", replicas)
-			// Show pod status
+			showPodStatus(kubectlCmd)
+			return nil
+		}
+		if running >= minRequired && pending > 0 && waited >= 20 {
+			// We have enough pods and some are stuck pending (likely resource constraints)
+			fmt.Println()
+			logSuccess("%d/%d pods ready (sufficient for operation, %d pending due to resources)", running, replicas, pending)
 			showPodStatus(kubectlCmd)
 			return nil
 		}
 		if waited == 0 || waited%10 == 0 {
-			fmt.Printf("\r  Pods ready: %d/%d (Pending: %d)", running, replicas, pending)
+			fmt.Printf("\r  Pods ready: %d/%d (Pending: %d, need: %d)", running, replicas, pending, minRequired)
 		} else {
 			fmt.Printf("\r  Pods ready: %d/%d", running, replicas)
 		}
@@ -492,7 +501,11 @@ func waitForPods(replicas int) error {
 	cmd := exec.Command(kubectlCmd, "get", "pods", "-l", "app=orchestrator", "--no-headers")
 	output, _ := cmd.Output()
 	running := strings.Count(string(output), "Running")
-	logWarning("Only %d/%d pods ready after %ds", running, replicas, maxWait)
+	if running >= minRequired {
+		logSuccess("%d/%d pods ready (sufficient after timeout)", running, replicas)
+	} else {
+		logWarning("Only %d/%d pods ready after %ds (need at least %d)", running, replicas, maxWait, minRequired)
+	}
 	showPodStatus(kubectlCmd)
 	return nil
 }
