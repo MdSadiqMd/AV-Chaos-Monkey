@@ -1,0 +1,128 @@
+# WebRTC Connector Pods
+# Dedicated pods for handling WebRTC client connections
+# These proxy requests to orchestrator pods, offloading connection handling
+# Auto-scales based on client load
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webrtc-connector
+  labels:
+    app: webrtc-connector
+spec:
+  replicas: 3 # Start with 3, HPA will scale based on load
+  selector:
+    matchLabels:
+      app: webrtc-connector
+  template:
+    metadata:
+      labels:
+        app: webrtc-connector
+    spec:
+      containers:
+        - name: connector
+          image: chaos-monkey-orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: CONNECTOR_MODE
+              value: "true"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: ORCHESTRATOR_SERVICE
+              value: "orchestrator-headless"
+            - name: TOTAL_PARTITIONS
+              value: "10"
+            - name: TURN_HOST
+              value: "coturn-lb"
+            - name: TURN_REPLICAS
+              value: "3"
+            - name: TURN_USERNAME
+              value: "webrtc"
+            - name: TURN_PASSWORD
+              value: "webrtc123"
+            # Connection pool settings
+            - name: MAX_CONCURRENT_CONNECTIONS
+              value: "100"
+            - name: CONNECTION_TIMEOUT
+              value: "60s"
+            - name: IDLE_TIMEOUT
+              value: "120s"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+# Load-balanced service for client connections
+apiVersion: v1
+kind: Service
+metadata:
+  name: webrtc-connector
+  labels:
+    app: webrtc-connector
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: webrtc-connector
+---
+# HPA for auto-scaling connectors based on CPU/connections
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webrtc-connector-hpa
+  labels:
+    app: webrtc-connector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webrtc-connector
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
