@@ -10,7 +10,7 @@ service OrchestratorService {
   rpc SetRemoteAnswer(SetRemoteAnswerRequest) returns (SetRemoteAnswerResponse);
   rpc StartTest(StartTestRequest) returns (StartTestResponse);
   rpc InjectSpike(InjectSpikeRequest) returns (InjectSpikeResponse);
-  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+  rpc GetMetrics(GetMetricsRequest) returns (MetricsResponse);
   rpc StopTest(StopTestRequest) returns (StopTestResponse);
   rpc GetICECandidates(GetICECandidatesRequest) returns (stream ICECandidate);
   rpc AddICECandidate(AddICECandidateRequest) returns (AddICECandidateResponse);
@@ -25,6 +25,28 @@ message CreateTestRequest {
   repeated SpikeEvent spikes = 6;
   bool enable_network_degradation = 7;
   string backend_rtp_base_port = 8;
+  SpikeDistributionConfig spike_distribution = 9;  // Configuration for spike distribution
+}
+
+// Configuration for how spikes are distributed across the test duration
+message SpikeDistributionConfig {
+  // Distribution strategy: "even", "random", "front_loaded", "back_loaded", "legacy"
+  // "legacy" uses exact start_offset_seconds from each spike (old behavior)
+  // Default: "even" - distributes spikes evenly across test duration
+  string strategy = 1;
+  
+  // Minimum spacing between spike injections in seconds
+  // Default: 5 seconds
+  int32 min_spacing_seconds = 2;
+  
+  // Jitter percentage (0-100) to add randomness to spike timing
+  // Default: 15
+  int32 jitter_percent = 3;
+  
+  // Whether to respect start_offset_seconds as minimum delay
+  // If true, spikes won't start before their defined offset
+  // Default: true
+  bool respect_min_offset = 4;
 }
 
 message VideoConfig {
