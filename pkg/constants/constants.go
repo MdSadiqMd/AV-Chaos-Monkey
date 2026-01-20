@@ -4,6 +4,8 @@ const (
 	DefaultTargetHost = "127.0.0.1"
 	DefaultTargetPort = 5002
 
+	RTCPFeedbackPort = 5003
+
 	MetricsCacheTTL       = 500
 	MetricsAggregatorTick = 250
 
