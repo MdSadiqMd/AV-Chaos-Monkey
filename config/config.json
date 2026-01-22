@@ -1,0 +1,62 @@
+{
+  "base_url": "http://localhost:8080",
+  "media_path": "public/rick-roll.mp4",
+  "num_participants": 1500,
+  "duration_seconds": 600,
+  "spikes": {
+    "count": 70,
+    "interval_seconds": 5,
+    "types": {
+      "rtp_packet_loss": {
+        "weight": 40,
+        "params": {
+          "loss_percentage_min": 1,
+          "loss_percentage_max": 25,
+          "patterns": ["random", "burst"]
+        }
+      },
+      "network_jitter": {
+        "weight": 20,
+        "params": {
+          "base_latency_ms_min": 10,
+          "base_latency_ms_max": 50,
+          "jitter_std_dev_ms_min": 20,
+          "jitter_std_dev_ms_max": 200
+        }
+      },
+      "frame_drop": {
+        "weight": 20,
+        "params": {
+          "drop_percentage_min": 10,
+          "drop_percentage_max": 60
+        }
+      },
+      "bitrate_reduce": {
+        "weight": 20,
+        "params": {
+          "reduction_percent_min": 30,
+          "reduction_percent_max": 80,
+          "transition_seconds_min": 1,
+          "transition_seconds_max": 5
+        }
+      }
+    },
+    "duration_seconds_min": 2,
+    "duration_seconds_max": 8,
+    "participant_selection": {
+      "single_weight": 40,
+      "multiple_weight": 35,
+      "all_weight": 25,
+      "multiple_count_min": 2,
+      "multiple_count_max": 5
+    }
+  },
+  "spike_distribution": {
+    "strategy": "random",
+    "min_spacing_seconds": 5,
+    "jitter_percent": 15
+  },
+  "metrics": {
+    "display_interval_seconds": 2
+  }
+}
