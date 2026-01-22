@@ -691,7 +691,6 @@ func (p *VirtualParticipant) AddICECandidate(candidate string) error {
 	})
 }
 
-// Return WebRTC statistics
 func (p *VirtualParticipant) GetStats() map[string]any {
 	stats := p.peerConn.GetStats()
 	result := make(map[string]any)
@@ -711,10 +710,44 @@ func (p *VirtualParticipant) GetStats() map[string]any {
 				"current_round_trip":  v.CurrentRoundTripTime,
 				"available_bandwidth": v.AvailableOutgoingBitrate,
 			}
+		case pionwebrtc.RemoteInboundRTPStreamStats:
+			result["remote_inbound_rtp"] = map[string]any{
+				"packets_lost":    v.PacketsLost,
+				"jitter":          v.Jitter,
+				"round_trip_time": v.RoundTripTime,
+				"fraction_lost":   v.FractionLost,
+			}
 		}
 	}
 
 	return result
+}
+
+// Extracts RTCP-based metrics
+func (p *VirtualParticipant) GetRealMetrics() (packetLoss float64, jitterMs float64, rttMs float64) {
+	if p.peerConn == nil {
+		return 0, 0, 0
+	}
+
+	stats := p.peerConn.GetStats()
+	for _, s := range stats {
+		switch v := s.(type) {
+		case pionwebrtc.RemoteInboundRTPStreamStats:
+			// FractionLost is 0-1
+			packetLoss = v.FractionLost * 100
+			// Jitter is in seconds, convert to ms
+			jitterMs = v.Jitter * 1000
+			// RTT is in seconds, convert to ms
+			rttMs = v.RoundTripTime * 1000
+			return
+		case pionwebrtc.ICECandidatePairStats:
+			// Fallback to ICE RTT if no RTCP stats
+			if rttMs == 0 && v.CurrentRoundTripTime > 0 {
+				rttMs = v.CurrentRoundTripTime * 1000
+			}
+		}
+	}
+	return
 }
 
 // Converts H.264 NALU to RTP packets with proper fragmentation
