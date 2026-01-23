@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/media"
 	customMiddleware "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/middleware"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/pool"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/scheduler"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/spike"
 	webrtc "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/webrtc"
 	"github.com/go-chi/chi/v5"
@@ -38,6 +40,7 @@ type TestSession struct {
 	State           string
 	StartTime       time.Time
 	ScheduledSpikes []*pb.SpikeEvent
+	SpikeScheduler  *scheduler.SpikeScheduler
 }
 
 func (ts *TestSession) StateValue() int {
@@ -364,15 +367,52 @@ func (s *HTTPServer) handleStartTest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// Start the pool in background goroutine to avoid blocking HTTP response
-	// This prevents "signal: killed" errors when starting many participants and concurrently starting the reciever tests
 	go func() {
 		session.Pool.Start()
-		log.Printf("[HTTP] Test %s: Started %d participants in background", session.ID, participantCount)
+		logging.LogSuccess("Test %s: Started %d participants in background", session.ID, participantCount)
 	}()
 
-	// Schedule spikes in background
-	for _, spike := range session.ScheduledSpikes {
-		go s.scheduleSpike(session, spike)
+	// Schedule spikes with distribution based on configuration
+	if len(session.ScheduledSpikes) > 0 {
+		// Get spike distribution config from request (or use defaults)
+		spikeConfig := s.getSpikeDistributionConfig(session.Config)
+
+		// Check if using legacy behavior ("legacy")
+		if spikeConfig.DistributionStrategy == "legacy" {
+			// Legacy behavior: schedule spikes at their exact offsets
+			for _, spike := range session.ScheduledSpikes {
+				go s.scheduleSpike(session, spike)
+			}
+			logging.LogInfo("Test %s: Scheduled %d spikes with legacy timing",
+				session.ID, len(session.ScheduledSpikes))
+		} else {
+			// Use spike scheduler for even distribution
+			injectFunc := func(spikeEvent *pb.SpikeEvent) error {
+				if session.Pool != nil {
+					session.Pool.InjectSpike(spikeEvent)
+				}
+				return s.spikeInject.Inject(spikeEvent)
+			}
+
+			// Calculate test duration from config or spikes
+			testDuration := time.Duration(session.Config.DurationSeconds) * time.Second
+			if testDuration == 0 {
+				testDuration = 5 * time.Minute
+				for _, sp := range session.ScheduledSpikes {
+					endTime := time.Duration(sp.StartOffsetSeconds+sp.DurationSeconds) * time.Second
+					if endTime > testDuration {
+						testDuration = endTime + time.Minute
+					}
+				}
+			}
+
+			session.SpikeScheduler = scheduler.NewSpikeScheduler(spikeConfig, injectFunc)
+			session.SpikeScheduler.ScheduleSpikes(session.ScheduledSpikes, spikeConfig)
+			session.SpikeScheduler.Start()
+
+			logging.LogInfo("Test %s: Scheduled %d spikes with %s distribution over %v",
+				session.ID, len(session.ScheduledSpikes), spikeConfig.DistributionStrategy, testDuration)
+		}
 	}
 
 	// Encode and write response (this should be fast)
@@ -381,22 +421,35 @@ func (s *HTTPServer) handleStartTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[HTTP] Test %s start request completed (participants starting in background)", session.ID)
+	logging.LogInfo("Test %s start request completed (participants starting in background)", session.ID)
 }
 
-func (s *HTTPServer) scheduleSpike(session *TestSession, spikeEvent *pb.SpikeEvent) {
-	if session == nil || session.Pool == nil || spikeEvent == nil {
-		return
-	}
-	if spikeEvent.StartOffsetSeconds > 0 {
-		time.Sleep(time.Duration(spikeEvent.StartOffsetSeconds) * time.Second)
-	}
-	if session.Pool == nil {
-		return
+func (s *HTTPServer) getSpikeDistributionConfig(req *pb.CreateTestRequest) *scheduler.SpikeSchedulerConfig {
+	config := scheduler.DefaultSpikeSchedulerConfig()
+	if req.DurationSeconds > 0 {
+		config.TestDuration = time.Duration(req.DurationSeconds) * time.Second
 	}
 
-	session.Pool.InjectSpike(spikeEvent)
-	s.spikeInject.Inject(spikeEvent)
+	// Apply user-provided spike distribution config if present
+	if req.SpikeDistribution != nil {
+		sd := req.SpikeDistribution
+
+		if sd.Strategy != "" {
+			config.DistributionStrategy = sd.Strategy
+		}
+
+		if sd.MinSpacingSeconds > 0 {
+			config.MinSpacing = time.Duration(sd.MinSpacingSeconds) * time.Second
+		}
+
+		if sd.JitterPercent > 0 {
+			config.JitterPercent = int(sd.JitterPercent)
+		}
+
+		// Note: respect_min_offset is handled in the scheduler
+	}
+
+	return config
 }
 
 func (s *HTTPServer) handleStopTest(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +461,9 @@ func (s *HTTPServer) handleStopTest(w http.ResponseWriter, r *http.Request) {
 	if session.Pool == nil {
 		http.Error(w, "Test session not available", http.StatusServiceUnavailable)
 		return
+	}
+	if session.SpikeScheduler != nil {
+		session.SpikeScheduler.Stop()
 	}
 
 	session.Pool.Stop()
@@ -422,6 +478,22 @@ func (s *HTTPServer) handleStopTest(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// scheduleSpike is kept for backward compatibility with runtime spike injection
+func (s *HTTPServer) scheduleSpike(session *TestSession, spikeEvent *pb.SpikeEvent) {
+	if session == nil || session.Pool == nil || spikeEvent == nil {
+		return
+	}
+	if spikeEvent.StartOffsetSeconds > 0 {
+		time.Sleep(time.Duration(spikeEvent.StartOffsetSeconds) * time.Second)
+	}
+	if session.Pool == nil {
+		return
+	}
+
+	session.Pool.InjectSpike(spikeEvent)
+	s.spikeInject.Inject(spikeEvent)
 }
 
 func (s *HTTPServer) handleGetAllMetrics(w http.ResponseWriter, r *http.Request) {

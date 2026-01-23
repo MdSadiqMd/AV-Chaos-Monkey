@@ -2,11 +2,11 @@ package spike
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/network"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
 )
@@ -91,7 +91,7 @@ func (inj *Injector) Inject(spike *pb.SpikeEvent) error {
 	active.Applied = true
 	inj.activeSpikes[spike.SpikeId] = active
 
-	log.Printf("[Spike] Injected spike %s type=%s duration=%ds",
+	logging.LogChaos("Injected spike %s type=%s duration=%ds",
 		spike.SpikeId, spike.Type, spike.DurationSeconds)
 
 	if spike.DurationSeconds > 0 {
@@ -116,12 +116,12 @@ func (inj *Injector) Remove(SpikeId string) error {
 	}
 	if active.Cleanup != nil {
 		if err := active.Cleanup(); err != nil {
-			log.Printf("[Spike] Cleanup error for %s: %v", SpikeId, err)
+			logging.LogError("Cleanup error for %s: %v", SpikeId, err)
 		}
 	}
 
 	delete(inj.activeSpikes, SpikeId)
-	log.Printf("[Spike] Removed spike %s", SpikeId)
+	logging.LogInfo("Removed spike %s", SpikeId)
 
 	return nil
 }
@@ -171,15 +171,15 @@ func (inj *Injector) applyPacketLoss(spike *pb.SpikeEvent) (func() error, error)
 
 	// Applies packet loss using OS network tools
 	if err := inj.degrader.ApplyPacketLoss(lossPct, port); err != nil {
-		log.Printf("[Spike] Warning: Failed to apply real packet loss: %v (falling back to application-level)", err)
+		logging.LogWarning("Failed to apply real packet loss: %v (falling back to application-level)", err)
 		// Fall back to application-level packet loss (handled in pool/participant.go
 		return func() error { return nil }, nil
 	}
 
-	log.Printf("[Spike] Applied real %d%% packet loss on port %d", lossPct, port)
+	logging.LogChaos("Applied real %d%% packet loss on port %d", lossPct, port)
 
 	cleanup := func() error {
-		log.Printf("[Spike] Removing packet loss")
+		logging.LogInfo("Removing packet loss")
 		return inj.degrader.RemoveAll()
 	}
 
@@ -208,14 +208,14 @@ func (inj *Injector) applyJitter(spike *pb.SpikeEvent) (func() error, error) {
 
 	// Applies latency/jitter using OS network tools
 	if err := inj.degrader.ApplyLatency(baseLatency, jitter, port); err != nil {
-		log.Printf("[Spike] Warning: Failed to apply real jitter: %v (network jitter will not be applied)", err)
+		logging.LogWarning("Failed to apply real jitter: %v (network jitter will not be applied)", err)
 		return func() error { return nil }, nil
 	}
 
-	log.Printf("[Spike] Applied real %dms latency with %dms jitter on port %d", baseLatency, jitter, port)
+	logging.LogChaos("Applied real %dms latency with %dms jitter on port %d", baseLatency, jitter, port)
 
 	cleanup := func() error {
-		log.Printf("[Spike] Removing jitter")
+		logging.LogInfo("Removing jitter")
 		return inj.degrader.RemoveAll()
 	}
 
@@ -240,14 +240,14 @@ func (inj *Injector) applyBandwidthLimit(spike *pb.SpikeEvent) (func() error, er
 	}
 
 	if err := inj.degrader.ApplyBandwidthLimit(kbps, port); err != nil {
-		log.Printf("[Spike] Warning: Failed to apply bandwidth limit: %v", err)
+		logging.LogWarning("Failed to apply bandwidth limit: %v", err)
 		return func() error { return nil }, nil
 	}
 
-	log.Printf("[Spike] Applied %d kbps bandwidth limit on port %d", kbps, port)
+	logging.LogChaos("Applied %d kbps bandwidth limit on port %d", kbps, port)
 
 	cleanup := func() error {
-		log.Printf("[Spike] Removing bandwidth limit")
+		logging.LogInfo("Removing bandwidth limit")
 		return inj.degrader.RemoveAll()
 	}
 
