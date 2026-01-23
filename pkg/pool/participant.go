@@ -4,7 +4,6 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"sync"
@@ -12,9 +11,11 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/media"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 	pb "github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/protobuf"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/rtcp"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/rtp"
 )
 
@@ -83,6 +84,10 @@ type ParticipantPool struct {
 	cachedMetrics     *pb.MetricsResponse
 	cachedMetricsTime time.Time
 	metricsCacheTTL   time.Duration
+
+	// RTCP feedback server for real metrics
+	rtcpServer   *rtcp.Server
+	rtcpFeedback *rtcp.FeedbackStore
 }
 
 type WebRTCParticipant interface {
@@ -95,6 +100,7 @@ type WebRTCParticipant interface {
 	Close() error
 	GetPeerConnection() any
 	NeedsRecreation() (bool, string)
+	GetRealMetrics() (packetLoss float64, jitterMs float64, rttMs float64)
 }
 
 func NewParticipantPool(testID string) *ParticipantPool {
@@ -104,7 +110,14 @@ func NewParticipantPool(testID string) *ParticipantPool {
 		testID:             testID,
 		targetHost:         constants.DefaultTargetHost,
 		metricsCacheTTL:    constants.MetricsCacheTTL * time.Millisecond,
+		rtcpFeedback:       rtcp.GetGlobalFeedback(),
 	}
+
+	pp.rtcpServer = rtcp.NewServer(constants.RTCPFeedbackPort)
+	if err := pp.rtcpServer.Start(); err != nil {
+		logging.LogWarning("Failed to start RTCP server: %v (metrics will be simulated)", err)
+	}
+
 	// background metrics aggregator
 	go pp.runMetricsAggregator()
 	return pp
@@ -116,7 +129,7 @@ func (pp *ParticipantPool) SetTarget(host string, port int) {
 	defer pp.mu.Unlock()
 	pp.targetHost = host
 	pp.targetPort = port
-	log.Printf("[Pool] Set target to %s:%d", host, port)
+	logging.LogConfig("Set target to %s:%d", host, port)
 }
 
 // Generate random bytes of specified length
@@ -172,10 +185,10 @@ func (pp *ParticipantPool) AddParticipant(id uint32, video *pb.VideoConfig, audi
 	if err := participant.SetupUDP(targetHost, targetPort); err != nil {
 		return nil, fmt.Errorf("failed to setup UDP for participant %d: %w", id, err)
 	}
-	log.Printf("[Pool] Participant %d: UDP ready, sending RTP packets to %s:%d", id, targetHost, targetPort)
+	logging.LogInfo("Participant %d: UDP ready, sending RTP packets to %s:%d", id, targetHost, targetPort)
 
 	pp.participants[id] = participant
-	log.Printf("[Pool] Added participant %d on port %d", id, backendPort)
+	logging.LogInfo("Added participant %d on port %d", id, backendPort)
 
 	return participant, nil
 }
@@ -203,7 +216,7 @@ func (p *VirtualParticipant) SetupUDP(host string, port int) error {
 	p.udpConn = conn
 	p.targetAddr = targetAddr
 
-	log.Printf("[Participant %d] UDP socket ready: local=%s target=%s", p.ID, conn.LocalAddr(), targetAddr)
+	logging.LogInfo("Participant %d: UDP socket ready: local=%s target=%s", p.ID, conn.LocalAddr(), targetAddr)
 	return nil
 }
 
@@ -220,12 +233,12 @@ func (pp *ParticipantPool) AddWebRTCParticipant(id uint32, participant WebRTCPar
 	isRunning := pp.running.Load()
 	pp.webrtcParticipantsMu.Unlock()
 
-	log.Printf("[Pool] Added WebRTC participant %d (test running: %v)", id, isRunning)
+	logging.LogInfo("Added WebRTC participant %d (test running: %v)", id, isRunning)
 
 	// If test is already running, start the participant immediately
 	if isRunning {
 		participant.Start()
-		log.Printf("[Pool] Started WebRTC participant %d (test was already running)", id)
+		logging.LogInfo("Started WebRTC participant %d (test was already running)", id)
 	}
 }
 
@@ -239,7 +252,7 @@ func (pp *ParticipantPool) RemoveWebRTCParticipant(id uint32) {
 	pp.webrtcParticipantsMu.Lock()
 	defer pp.webrtcParticipantsMu.Unlock()
 	delete(pp.webrtcParticipants, id)
-	log.Printf("[Pool] Removed WebRTC participant %d", id)
+	logging.LogInfo("Removed WebRTC participant %d", id)
 }
 
 func (pp *ParticipantPool) GetAllParticipants() []*VirtualParticipant {
@@ -257,7 +270,7 @@ func (pp *ParticipantPool) Start() {
 	pp.startTime = time.Now()
 	pp.running.Store(true)
 
-	// Start participants concurrently to avoid blocking
+	// Collect participants
 	pp.mu.RLock()
 	participantCount := len(pp.participants)
 	participants := make([]*VirtualParticipant, 0, participantCount)
@@ -265,50 +278,25 @@ func (pp *ParticipantPool) Start() {
 		participants = append(participants, p)
 	}
 	pp.mu.RUnlock()
+	logging.LogInfo("Starting %d UDP participants", participantCount)
 
-	// Start UDP participants in batches to avoid overwhelming the system
-	// Use smaller batch size and longer delays to prevent OOM kills
-	batchSize := constants.DefaultBatchSize
-	batchDelay := constants.DefaultBatchDelay * time.Millisecond
-
-	// For large participant counts, use even smaller batches
-	if participantCount > constants.LargeParticipantCount {
-		batchSize = constants.LargeBatchSize
-		batchDelay = constants.LargeBatchDelay * time.Millisecond
-	}
-	if participantCount > constants.VeryLargeParticipantCount {
-		batchSize = constants.VeryLargeBatchSize
-		batchDelay = constants.VeryLargeBatchDelay * time.Millisecond
+	// Start all participants - they will stream synchronized video/audio
+	for _, p := range participants {
+		p.Start()
 	}
 
-	log.Printf("[Pool] Starting %d UDP participants in batches of %d", participantCount, batchSize)
-
-	for i := 0; i < len(participants); i += batchSize {
-		end := min(i+batchSize, len(participants))
-		batch := participants[i:end]
-		for _, p := range batch {
-			p.Start()
-		}
-		// Delay between batches to prevent resource spikes and OOM kills
-		if end < len(participants) {
-			time.Sleep(batchDelay)
-		}
-	}
-
-	// Start WebRTC participants concurrently
 	pp.webrtcParticipantsMu.Lock()
 	webrtcParticipants := make([]WebRTCParticipant, 0, len(pp.webrtcParticipants))
 	for _, wp := range pp.webrtcParticipants {
 		webrtcParticipants = append(webrtcParticipants, wp)
 	}
-
 	webrtcCount := len(webrtcParticipants)
 	pp.webrtcParticipantsMu.Unlock()
 	for _, wp := range webrtcParticipants {
 		wp.Start()
 	}
 
-	log.Printf("[Pool] Started %d UDP participants and %d WebRTC participants", participantCount, webrtcCount)
+	logging.LogSuccess("Started %d UDP participants and %d WebRTC participants", participantCount, webrtcCount)
 }
 
 func (pp *ParticipantPool) Stop() {
@@ -329,7 +317,7 @@ func (pp *ParticipantPool) Stop() {
 	webrtcCount := len(pp.webrtcParticipants)
 	pp.webrtcParticipantsMu.Unlock()
 
-	log.Printf("[Pool] Stopped %d UDP participants and %d WebRTC participants", udpCount, webrtcCount)
+	logging.LogInfo("Stopped %d UDP participants and %d WebRTC participants", udpCount, webrtcCount)
 }
 
 // Background worker to update cached metrics
@@ -353,6 +341,7 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 	// Quick aggregate without individual participant metrics
 	var totalFrames, totalPackets, totalBitrate int64
 	var totalJitter, totalLoss, totalMos float64
+	var realMetricsCount float64
 
 	// Collect participant list for metrics generation
 	participantsList := make([]*VirtualParticipant, 0, participantCount)
@@ -363,6 +352,19 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 		totalPackets += p.packetsSent.Load()
 		totalBitrate += int64(p.VideoConfig.BitrateKbps)
 
+		ssrc := p.ID * 1000 // SSRC is participant ID * 1000
+		if pp.rtcpFeedback != nil {
+			loss, jitter, rtt := pp.rtcpFeedback.GetMetrics(ssrc)
+			if loss > 0 || jitter > 0 || rtt > 0 {
+				totalLoss += loss
+				totalJitter += jitter
+				totalMos += calculateMOS(loss, jitter, rtt)
+				realMetricsCount++
+				continue
+			}
+		}
+
+		// Fallback to local metrics if no RTCP feedback
 		pm := p.GetMetrics()
 		totalMos += pm.MosScore
 		totalLoss += pm.PacketLossPercent
@@ -370,13 +372,29 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 	}
 	pp.mu.RUnlock()
 
-	count := float64(participantCount)
-	if count == 0 {
-		count = 1
+	pp.webrtcParticipantsMu.RLock()
+	webrtcCount := len(pp.webrtcParticipants)
+	for _, wp := range pp.webrtcParticipants {
+		loss, jitter, rtt := wp.GetRealMetrics()
+		if loss > 0 || jitter > 0 || rtt > 0 {
+			totalLoss += loss
+			totalJitter += jitter
+			totalMos += calculateMOS(loss, jitter, rtt)
+			realMetricsCount++
+		}
+	}
+	pp.webrtcParticipantsMu.RUnlock()
+
+	totalCount := float64(participantCount + webrtcCount)
+	if totalCount == 0 {
+		totalCount = 1
 	}
 
-	// Cap packet loss at 100% (is already be capped in GetPacketLoss, but I'm insecure)
-	avgLoss := totalLoss / count
+	if realMetricsCount > 0 {
+		logging.LogInfo("Using real RTCP metrics for %.0f/%.0f participants", realMetricsCount, totalCount)
+	}
+
+	avgLoss := totalLoss / totalCount
 	if avgLoss > 100.0 {
 		avgLoss = 100.0
 	}
@@ -400,8 +418,7 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 				continue
 			}
 			if i%sampleRate == 0 {
-				// Get individual metrics (this is fast - uses atomic loads)
-				pm := p.GetMetrics()
+				pm := p.GetMetricsWithRTCP(pp.rtcpFeedback)
 				if pm != nil {
 					participantMetrics = append(participantMetrics, pm)
 				}
@@ -416,9 +433,9 @@ func (pp *ParticipantPool) updateCachedMetrics() {
 		Aggregate: &pb.AggregateMetrics{
 			TotalFramesSent:  totalFrames,
 			TotalPacketsSent: totalPackets,
-			AvgJitterMs:      totalJitter / count,
+			AvgJitterMs:      totalJitter / totalCount,
 			AvgPacketLoss:    avgLoss,
-			AvgMosScore:      totalMos / count,
+			AvgMosScore:      totalMos / totalCount,
 			TotalBitrateKbps: totalBitrate,
 		},
 	}
@@ -488,7 +505,7 @@ func (pp *ParticipantPool) InjectSpike(spike *pb.SpikeEvent) error {
 		p.AddSpike(spike)
 	}
 
-	log.Printf("[Pool] Injected spike %s type=%s to %d participants",
+	logging.LogChaos("Injected spike %s type=%s to %d participants",
 		spike.SpikeId, spike.Type, len(participants))
 
 	return nil
@@ -575,7 +592,7 @@ func (p *VirtualParticipant) runFrameLoop() {
 			if err != nil {
 				// Network error - count as lost
 				p.metrics.RecordPacketLost()
-				log.Printf("[Participant %d] UDP send error: %v", p.ID, err)
+				logging.LogError("Participant %d: UDP send error: %v", p.ID, err)
 				continue
 			}
 		}
@@ -641,7 +658,7 @@ func (p *VirtualParticipant) runVideoLoop() {
 	defer ticker.Stop()
 
 	totalFrames := p.mediaSource.GetTotalVideoFrames()
-	log.Printf("[Participant %d] Starting video stream: %d frames at %dfps (looping)",
+	logging.LogInfo("Participant %d: Starting video stream: %d frames at %dfps (looping)",
 		p.ID, totalFrames, fps)
 
 	for range ticker.C {
@@ -710,8 +727,7 @@ func (p *VirtualParticipant) runAudioLoop() {
 	defer ticker.Stop()
 
 	totalFrames := p.mediaSource.GetTotalAudioFrames()
-	log.Printf("[Participant %d] Starting audio stream: %d frames (looping)",
-		p.ID, totalFrames)
+	logging.LogInfo("Participant %d: Starting audio stream: %d frames (looping)", p.ID, totalFrames)
 
 	for range ticker.C {
 		if !p.active.Load() {
@@ -808,7 +824,7 @@ func (p *VirtualParticipant) AddSpike(spike *pb.SpikeEvent) {
 			var kbps int32
 			fmt.Sscanf(newBitrate, "%d", &kbps)
 			p.VideoConfig.BitrateKbps = kbps
-			log.Printf("[Participant %d] Reduced bitrate to %d kbps", p.ID, kbps)
+			logging.LogChaos("Participant %d: Reduced bitrate to %d kbps", p.ID, kbps)
 		}
 	}
 
@@ -829,37 +845,131 @@ func (p *VirtualParticipant) RemoveSpike(spikeID string) {
 }
 
 func (p *VirtualParticipant) GetMetrics() *pb.ParticipantMetrics {
+	return p.GetMetricsWithRTCP(nil)
+}
+
+func (p *VirtualParticipant) GetMetricsWithRTCP(feedback *rtcp.FeedbackStore) *pb.ParticipantMetrics {
 	p.activeSpikesMu.RLock()
 	activeSpikeCount := int32(len(p.activeSpikes))
-
-	// Calculate simulated jitter based on active jitter spikes
-	simulatedJitter := p.metrics.GetJitter() // Base jitter from actual measurements
-	for _, spike := range p.activeSpikes {
-		if spike.Type == "network_jitter" {
-			// Extract jitter parameters from spike
-			if jitterStr, ok := spike.Params["jitter_std_dev_ms"]; ok {
-				var jitterMs int
-				fmt.Sscanf(jitterStr, "%d", &jitterMs)
-				// Add simulated jitter variance (use half of std dev as average effect)
-				simulatedJitter += float64(jitterMs) / 2.0
-			}
-		}
-	}
 	p.activeSpikesMu.RUnlock()
+
+	var jitterMs, packetLoss, mosScore float64
+
+	ssrc := p.ID * 1000
+	if feedback != nil {
+		loss, jitter, rtt := feedback.GetMetrics(ssrc)
+		if loss > 0 || jitter > 0 || rtt > 0 {
+			jitterMs = jitter
+			packetLoss = loss
+			mosScore = calculateMOS(loss, jitter, rtt)
+		} else {
+			// Fallback to local metrics
+			jitterMs = p.metrics.GetJitter()
+			packetLoss = p.metrics.GetPacketLoss()
+			mosScore = p.metrics.GetMOS()
+		}
+	} else {
+		// No feedback store, use local metrics
+		jitterMs = p.metrics.GetJitter()
+		packetLoss = p.metrics.GetPacketLoss()
+		mosScore = p.metrics.GetMOS()
+	}
 
 	return &pb.ParticipantMetrics{
 		ParticipantId:      p.ID,
 		FramesSent:         p.frameCount.Load(),
 		BytesSent:          p.bytesSent.Load(),
 		PacketsSent:        p.packetsSent.Load(),
-		JitterMs:           simulatedJitter,
-		PacketLossPercent:  p.metrics.GetPacketLoss(),
+		JitterMs:           jitterMs,
+		PacketLossPercent:  packetLoss,
 		NackCount:          p.metrics.GetNackCount(),
 		PliCount:           p.metrics.GetPliCount(),
-		MosScore:           p.metrics.GetMOS(),
+		MosScore:           mosScore,
 		CurrentBitrateKbps: p.VideoConfig.BitrateKbps,
 		ActiveSpikeCount:   activeSpikeCount,
 	}
+}
+
+func calculateMOS(packetLoss, jitterMs, rttMs float64) float64 {
+	r0 := 93.2
+	delay := rttMs / 2
+
+	id := 0.024 * delay
+	if delay > 177.3 {
+		id = 0.024*delay + 0.11*(delay-177.3)*(1.0-exp(-(delay-177.3)/100.0))
+	}
+
+	ie := 0.0
+	if packetLoss > 0 {
+		ie = 30.0 * log(1.0+15.0*packetLoss/100.0)
+	}
+	if jitterMs > 10 {
+		ie += (jitterMs - 10) * 0.5
+	}
+
+	r := r0 - id - ie
+	if r < 0 {
+		r = 0
+	}
+	if r > 100 {
+		r = 100
+	}
+
+	mos := 1.0 + 0.035*r + r*(r-60)*(100-r)*7e-6
+	if mos < 1.0 {
+		mos = 1.0
+	}
+	if mos > 4.5 {
+		mos = 4.5
+	}
+	return mos
+}
+
+func exp(x float64) float64 {
+	// Simple approximation for small x
+	if x < -10 {
+		return 0
+	}
+	result := 1.0
+	term := 1.0
+	for i := 1; i < 20; i++ {
+		term *= x / float64(i)
+		result += term
+	}
+	return result
+}
+
+func log(x float64) float64 {
+	if x <= 0 {
+		return 0
+	}
+	// Newton's method for ln(x)
+	y := x - 1
+	if y > 1 || y < -0.5 {
+		// Use log(x) = log(x/e^n) + n for large x
+		n := 0.0
+		for x > 2.718281828 {
+			x /= 2.718281828
+			n++
+		}
+		for x < 1 {
+			x *= 2.718281828
+			n--
+		}
+		return log(x) + n
+	}
+	// Taylor series for ln(1+y) where |y| < 1
+	result := 0.0
+	term := y
+	for i := 1; i < 50; i++ {
+		if i%2 == 1 {
+			result += term / float64(i)
+		} else {
+			result -= term / float64(i)
+		}
+		term *= y
+	}
+	return result
 }
 
 func (p *VirtualParticipant) GetSetup() *pb.ParticipantSetup {
