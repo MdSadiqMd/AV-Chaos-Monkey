@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/config"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
 )
 
@@ -23,7 +24,7 @@ func main() {
 	flag.Parse()
 
 	if *useK8s {
-		projectRoot := getProjectRoot()
+		projectRoot := config.GetProjectRoot()
 		cmd := exec.Command("go", "run", filepath.Join(projectRoot, "tools", "k8s-start", "main.go"), "--setup")
 		cmd.Args = append(cmd.Args, flag.Args()...)
 		cmd.Stdout = os.Stdout
@@ -69,7 +70,7 @@ func runDockerMode(numParticipants, testDuration int, skipTest, autoDetect bool)
 	}
 
 	fmt.Println("Step 3: Building orchestrator...")
-	projectRoot := getProjectRoot()
+	projectRoot := config.GetProjectRoot()
 	cmd := exec.Command("docker-compose", "--profile", "monitoring", "build", "--no-cache", "orchestrator")
 	cmd.Dir = projectRoot
 	cmd.Stdout = os.Stdout
@@ -180,20 +181,4 @@ func waitForHealth(url string, maxRetries int) error {
 func getScriptDir() string {
 	execPath, _ := os.Executable()
 	return filepath.Dir(execPath)
-}
-
-func getProjectRoot() string {
-	// Try to find project root by looking for go.mod
-	dir, _ := os.Getwd()
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return "."
 }

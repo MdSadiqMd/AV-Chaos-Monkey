@@ -19,6 +19,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/config"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
@@ -40,6 +41,10 @@ type MediaConfig struct {
 	MediaPath string
 }
 
+type TestConfig struct {
+	ConfigPath string
+}
+
 func main() {
 	var (
 		replicas        = flag.Int("replicas", 0, "Number of replicas (0 = auto-detect)")
@@ -53,6 +58,7 @@ func main() {
 		videoPath       = flag.String("video", "", "Path to video file (mp4) for streaming")
 		audioPath       = flag.String("audio", "", "Path to audio file (mp3) for streaming")
 		mediaPath       = flag.String("media", "", "Path to media file (mkv/mp4) containing both video and audio")
+		configPath      = flag.String("config", "", "Path to chaos-test config JSON file")
 	)
 	flag.Parse()
 
@@ -94,20 +100,23 @@ func main() {
 		}
 	}
 
-	projectRoot := getProjectRoot()
+	projectRoot := config.GetProjectRoot()
 	mediaConfig := MediaConfig{
 		VideoPath: *videoPath,
 		AudioPath: *audioPath,
 		MediaPath: *mediaPath,
 	}
+	testConfig := TestConfig{
+		ConfigPath: *configPath,
+	}
 
-	if err := runK8sDeployment(projectRoot, *replicas, *numParticipants, *skipTest, *udpTargetHost, *udpTargetPort, mediaConfig); err != nil {
+	if err := runK8sDeployment(projectRoot, *replicas, *numParticipants, *skipTest, *udpTargetHost, *udpTargetPort, mediaConfig, testConfig); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, skipTest bool, udpTargetHost string, udpTargetPort int, mediaConfig MediaConfig) error {
+func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, skipTest bool, udpTargetHost string, udpTargetPort int, mediaConfig MediaConfig, testConfig TestConfig) error {
 	if err := checkPrerequisites(); err != nil {
 		return err
 	}
@@ -197,18 +206,25 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 	setupPortForwarding()
 
 	if !skipTest {
-		testID := fmt.Sprintf("chaos_test_%d", time.Now().Unix())
-
-		os.Setenv("NUM_PARTICIPANTS", strconv.Itoa(participants))
-		os.Setenv("TEST_DURATION_SECONDS", "600")
-		os.Setenv("BASE_URL", "http://localhost:8080")
-		os.Setenv("TEST_ID", testID)
-
 		chaosTestPath := filepath.Join(projectRoot, "tools", "chaos-test", "main.go")
-		cmd := exec.Command("go", "run", chaosTestPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Run()
+		if testConfig.ConfigPath != "" {
+			// Use config file
+			logInfo("Running chaos test with config: %s", testConfig.ConfigPath)
+			cmd := exec.Command("go", "run", chaosTestPath, "-config", testConfig.ConfigPath)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Run()
+		} else {
+			// No config provided - show usage
+			logError("No config file provided. Use -config flag.")
+			fmt.Println()
+			fmt.Println("Usage:")
+			fmt.Printf("  ./scripts/start_everything.sh run --video=<path> --config=config/config.json\n")
+			fmt.Println()
+			fmt.Println("Or run chaos-test manually:")
+			fmt.Printf("  go run tools/chaos-test/main.go -config config/config.json\n")
+			return fmt.Errorf("config file required")
+		}
 	}
 
 	return nil
@@ -831,7 +847,7 @@ func relayTCPToUDP(tcpAddr string, udpConn *net.UDPConn, udpAddr *net.UDPAddr, p
 
 func cleanupResources() {
 	logInfo("Cleaning up Kubernetes resources...")
-	projectRoot := getProjectRoot()
+	projectRoot := config.GetProjectRoot()
 	k8sDir := filepath.Join(projectRoot, "k8s")
 	kubectlCmd, _ := utils.FindCommand("kubectl")
 
@@ -841,7 +857,7 @@ func cleanupResources() {
 	exec.Command("pkill", "-f", "kubectl port-forward").Run()
 
 	// Cleanup Prometheus target files
-	if err := cleanupTargetFiles(projectRoot); err == nil {
+	if err := utils.CleanupTargetFiles(); err == nil {
 		logInfo("Cleaned up Prometheus target files")
 	}
 
@@ -867,12 +883,7 @@ func generateTargetFilesWithTestID(projectRoot string, testID string) error {
 	os.MkdirAll(targetsDir, 0755)
 
 	// Clear old target files
-	files, _ := os.ReadDir(targetsDir)
-	for _, f := range files {
-		if strings.HasSuffix(f.Name(), ".json") {
-			os.Remove(filepath.Join(targetsDir, f.Name()))
-		}
-	}
+	utils.CleanupTargetFiles()
 
 	// Create target files for each pod
 	lines := strings.SplitSeq(strings.TrimSpace(string(output)), "\n")
@@ -924,21 +935,6 @@ func generateTargetFilesWithTestID(projectRoot string, testID string) error {
 	}
 
 	logSuccess("Generated Prometheus target files in %s", targetsDir)
-	return nil
-}
-
-func cleanupTargetFiles(projectRoot string) error {
-	targetsDir := filepath.Join(projectRoot, "config", "prometheus", "targets")
-	files, err := os.ReadDir(targetsDir)
-	if err != nil {
-		return err
-	}
-
-	for _, f := range files {
-		if strings.HasSuffix(f.Name(), ".json") {
-			os.Remove(filepath.Join(targetsDir, f.Name()))
-		}
-	}
 	return nil
 }
 
@@ -1081,21 +1077,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func getProjectRoot() string {
-	dir, _ := os.Getwd()
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return "."
 }
 
 func setupCluster(clusterName string) error {
