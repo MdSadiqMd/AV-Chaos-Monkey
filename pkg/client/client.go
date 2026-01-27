@@ -2,13 +2,13 @@ package client
 
 import (
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/client/k8s"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/client/webrtc"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
 )
 
 // Re-export types for backward compatibility
@@ -44,9 +44,9 @@ func DefaultConfig() *Config {
 		MaxIdleConns:           200,
 		MaxIdleConnsPerHost:    50,
 		IdleConnTimeout:        90 * time.Second,
-		TURNHost:               getEnvOrDefault("TURN_HOST", detectTURNHost()),
-		TURNUsername:           getEnvOrDefault("TURN_USERNAME", "webrtc"),
-		TURNPassword:           getEnvOrDefault("TURN_PASSWORD", "webrtc123"),
+		TURNHost:               utils.GetEnvOrDefault("TURN_HOST", detectTURNHost()),
+		TURNUsername:           utils.GetEnvOrDefault("TURN_USERNAME", "webrtc"),
+		TURNPassword:           utils.GetEnvOrDefault("TURN_PASSWORD", "webrtc123"),
 		ICEDisconnectedTimeout: 30 * time.Second,
 		ICEFailedTimeout:       60 * time.Second,
 		ICEKeepaliveInterval:   5 * time.Second,
@@ -74,13 +74,6 @@ func (c *Config) NewHTTPClient() *http.Client {
 			DisableCompression:    true,
 		},
 	}
-}
-
-func getEnvOrDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
 }
 
 func detectTURNHost() string {
