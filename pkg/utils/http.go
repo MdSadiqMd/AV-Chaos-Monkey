@@ -78,3 +78,17 @@ func (c *HTTPClient) HealthCheck() error {
 	_, err := c.Get("/healthz")
 	return err
 }
+
+func MustJSON(v any) string {
+	data, _ := json.Marshal(v)
+	return string(data)
+}
+
+func GetFloat64(m map[string]any, key string) float64 {
+	if val, ok := m[key]; ok && val != nil {
+		if f, ok := val.(float64); ok {
+			return f
+		}
+	}
+	return 0
+}
