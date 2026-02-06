@@ -3,203 +3,18 @@ package main
 import (
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/client"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 )
 
 func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-}
-
-type RTPMetrics struct {
-	ParticipantID uint32
-
-	// Counters (atomic for thread safety)
-	packetsReceived atomic.Int64
-	packetsLost     atomic.Int64
-	bytesReceived   atomic.Int64
-
-	// Jitter calculation (RFC 3550)
-	mu              sync.RWMutex
-	lastTimestamp   uint32
-	lastArrivalTime time.Time
-	transit         int32
-	jitter          float64
-	jitterSamples   []float64
-
-	// RTT tracking
-	rttSamples []time.Duration
-	avgRTT     time.Duration
-
-	// Sequence tracking for packet loss
-	expectedSeq     uint16
-	receivedSeqNums map[uint16]bool
-	seqWrap         int
-}
-
-func NewRTPMetrics(participantID uint32) *RTPMetrics {
-	return &RTPMetrics{
-		ParticipantID:   participantID,
-		jitterSamples:   make([]float64, 0, 100),
-		rttSamples:      make([]time.Duration, 0, 100),
-		receivedSeqNums: make(map[uint16]bool),
-	}
-}
-
-func (m *RTPMetrics) RecordPacketReceived(rtpTimestamp uint32, seqNum uint16, size int) {
-	m.packetsReceived.Add(1)
-	m.bytesReceived.Add(int64(size))
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	arrivalTime := time.Now()
-	m.receivedSeqNums[seqNum] = true
-
-	// Handle sequence wrap-around
-	if m.expectedSeq > 0 && seqNum < 1000 && m.expectedSeq > 65000 {
-		m.seqWrap++
-	}
-	m.expectedSeq = seqNum + 1
-
-	// RFC 3550 jitter calculation
-	if m.lastTimestamp != 0 {
-		arrivalMs := int32(arrivalTime.UnixNano() / 1000000)
-		rtpMs := int32(rtpTimestamp / 90)
-		transit := arrivalMs - rtpMs
-		d := transit - m.transit
-		if d < 0 {
-			d = -d
-		}
-		m.jitter = m.jitter + (float64(d)-m.jitter)/16.0
-		m.jitterSamples = append(m.jitterSamples, m.jitter)
-		if len(m.jitterSamples) > 1000 {
-			m.jitterSamples = m.jitterSamples[500:]
-		}
-		m.transit = transit
-	} else {
-		m.transit = int32(arrivalTime.UnixNano()/1000000) - int32(rtpTimestamp/90)
-	}
-
-	m.lastTimestamp = rtpTimestamp
-	m.lastArrivalTime = arrivalTime
-}
-
-func (m *RTPMetrics) RecordRTT(rtt time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.rttSamples = append(m.rttSamples, rtt)
-	if len(m.rttSamples) > 100 {
-		m.rttSamples = m.rttSamples[1:]
-	}
-	var total time.Duration
-	for _, r := range m.rttSamples {
-		total += r
-	}
-	m.avgRTT = total / time.Duration(len(m.rttSamples))
-}
-
-func (m *RTPMetrics) GetJitter() float64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.jitter
-}
-
-func (m *RTPMetrics) GetPacketLoss() float64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if len(m.receivedSeqNums) == 0 {
-		return 0
-	}
-
-	var minSeq, maxSeq uint16
-	first := true
-	for seq := range m.receivedSeqNums {
-		if first {
-			minSeq, maxSeq = seq, seq
-			first = false
-		} else {
-			if seq < minSeq {
-				minSeq = seq
-			}
-			if seq > maxSeq {
-				maxSeq = seq
-			}
-		}
-	}
-
-	expected := int(maxSeq) - int(minSeq) + 1 + m.seqWrap*65536
-	received := len(m.receivedSeqNums)
-	if expected <= 0 {
-		return 0
-	}
-	return float64(expected-received) / float64(expected) * 100.0
-}
-
-func (m *RTPMetrics) GetRTT() time.Duration {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.avgRTT
-}
-
-// Calculates Mean Opinion Score using ITU-T G.107 E-model (1.0-4.5)
-func (m *RTPMetrics) GetMOS() float64 {
-	packetLoss := m.GetPacketLoss()
-	jitter := m.GetJitter()
-	rtt := m.GetRTT().Milliseconds()
-
-	r0 := 93.2
-	delay := float64(rtt) / 2
-
-	id := 0.024 * delay
-	if delay > 177.3 {
-		id = 0.024*delay + 0.11*(delay-177.3)*(1.0-math.Exp(-(delay-177.3)/100.0))
-	}
-
-	ie := 0.0
-	if packetLoss > 0 {
-		ie = 30.0 * math.Log(1.0+15.0*packetLoss/100.0)
-	}
-	if jitter > 10 {
-		ie += (jitter - 10) * 0.5
-	}
-
-	r := r0 - id - ie
-	if r < 0 {
-		r = 0
-	}
-	if r > 100 {
-		r = 100
-	}
-
-	mos := 1.0 + 0.035*r + r*(r-60)*(100-r)*7e-6
-	if mos < 1.0 {
-		mos = 1.0
-	}
-	if mos > 4.5 {
-		mos = 4.5
-	}
-	return mos
-}
-
-func (m *RTPMetrics) Snapshot() map[string]any {
-	return map[string]any{
-		"participant_id":      m.ParticipantID,
-		"packets_received":    m.packetsReceived.Load(),
-		"bytes_received":      m.bytesReceived.Load(),
-		"jitter_ms":           m.GetJitter(),
-		"packet_loss_percent": m.GetPacketLoss(),
-		"mos_score":           m.GetMOS(),
-		"rtt_ms":              m.GetRTT().Milliseconds(),
-	}
 }
 
 func main() {
@@ -222,7 +37,7 @@ func main() {
 	var connMu sync.Mutex
 
 	// Metrics per participant
-	metricsMap := make(map[uint32]*RTPMetrics)
+	metricsMap := make(map[uint32]*metrics.RTPMetrics)
 	var metricsMu sync.Mutex
 
 	k8sMgr := client.NewKubernetesManager(cfg)
@@ -244,7 +59,7 @@ func main() {
 	}
 
 	for _, conn := range connections {
-		metricsMap[conn.ID] = NewRTPMetrics(conn.ID)
+		metricsMap[conn.ID] = metrics.NewRTPMetrics(conn.ID)
 	}
 	runStatsLoop(connections, metricsMap, &metricsMu)
 }
@@ -351,7 +166,7 @@ func connectLocalMode(connMgr *client.ConnectionManager, baseURL, testID string,
 	return connections
 }
 
-func runStatsLoop(connections []*client.ParticipantConnection, metricsMap map[uint32]*RTPMetrics, metricsMu *sync.Mutex) {
+func runStatsLoop(connections []*client.ParticipantConnection, metricsMap map[uint32]*metrics.RTPMetrics, metricsMu *sync.Mutex) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -371,7 +186,7 @@ func runStatsLoop(connections []*client.ParticipantConnection, metricsMap map[ui
 	}
 }
 
-func printStatsWithMetrics(connections []*client.ParticipantConnection, metricsMap map[uint32]*RTPMetrics, metricsMu *sync.Mutex) {
+func printStatsWithMetrics(connections []*client.ParticipantConnection, metricsMap map[uint32]*metrics.RTPMetrics, metricsMu *sync.Mutex) {
 	if len(connections) == 0 {
 		log.Println("No connections to display")
 		return
