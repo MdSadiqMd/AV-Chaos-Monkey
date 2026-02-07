@@ -13,8 +13,11 @@ import (
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 )
 
+var startTime time.Time
+
 func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	startTime = time.Now()
 }
 
 func main() {
@@ -27,7 +30,6 @@ func main() {
 	testID := os.Args[2]
 	maxConnections := parseMaxConnections()
 
-	// Always run receiver locally - scale connector pods in cluster for performance
 	logConnectionMode(testID, maxConnections)
 
 	cfg := client.DefaultConfig()
@@ -36,13 +38,11 @@ func main() {
 	var connections []*client.ParticipantConnection
 	var connMu sync.Mutex
 
-	// Metrics per participant
 	metricsMap := make(map[uint32]*metrics.RTPMetrics)
 	var metricsMu sync.Mutex
 
 	k8sMgr := client.NewKubernetesManager(cfg)
 	if k8sMgr != nil && k8sMgr.IsAvailable() {
-		// Auto-scale connector pods based on requested connections
 		participantCount := maxConnections
 		if participantCount <= 0 {
 			participantCount = 1500 // Default assumption for "all"
@@ -52,7 +52,7 @@ func main() {
 		connections = connectLocalMode(connMgr, baseURL, testID, maxConnections, &connMu)
 	}
 
-	log.Printf("Successfully connected to %d participants", len(connections))
+	log.Printf("✓ Successfully connected to %d participants", len(connections))
 
 	if len(connections) == 0 {
 		log.Fatal("No successful connections")
@@ -65,12 +65,12 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Usage: go run webrtc_receiver.go <base_url> <test_id> [max_connections]")
+	fmt.Println("Usage: go run ./examples/go/webrtc_receiver.go <base_url> <test_id> [max_connections]")
 	fmt.Println("")
 	fmt.Println("Examples:")
-	fmt.Println("  go run webrtc_receiver.go http://localhost:8080 chaos_test_123 all")
-	fmt.Println("  go run webrtc_receiver.go http://localhost:8080 chaos_test_123 100")
-	fmt.Println("  go run webrtc_receiver.go http://localhost:8080 chaos_test_123 1")
+	fmt.Println("  go run ./examples/go/webrtc_receiver.go http://localhost:8080 chaos_test_123 all")
+	fmt.Println("  go run ./examples/go/webrtc_receiver.go http://localhost:8080 chaos_test_123 100")
+	fmt.Println("  go run ./examples/go/webrtc_receiver.go http://localhost:8080 chaos_test_123 1")
 	fmt.Println("")
 	fmt.Println("Environment variables:")
 	fmt.Println("  CONNECTOR_REPLICAS - Number of connector pods to scale (default: auto)")
@@ -98,7 +98,6 @@ func logConnectionMode(testID string, maxConnections int) {
 }
 
 func connectKubernetesMode(k8sMgr *client.KubernetesManager, connMgr *client.ConnectionManager, testID string, maxConnections int, participantCount int, connMu *sync.Mutex) []*client.ParticipantConnection {
-	// Auto-scale connector pods based on participant count
 	pods, err := k8sMgr.DiscoverPodsWithScale(participantCount)
 	if err != nil || len(pods) == 0 {
 		log.Fatal("No connector pods found or port-forward failed")
@@ -107,7 +106,7 @@ func connectKubernetesMode(k8sMgr *client.KubernetesManager, connMgr *client.Con
 
 	connectionsPerPod := maxConnections
 	if maxConnections > 0 {
-		connectionsPerPod = (maxConnections + len(pods) - 1) / len(pods) // Round up
+		connectionsPerPod = (maxConnections + len(pods) - 1) / len(pods)
 	}
 
 	log.Printf("Distributing connections across %d connector pods (~%d per pod)", len(pods), connectionsPerPod)
@@ -115,7 +114,6 @@ func connectKubernetesMode(k8sMgr *client.KubernetesManager, connMgr *client.Con
 	var connections []*client.ParticipantConnection
 	var wg sync.WaitGroup
 
-	// Connect to all pods concurrently - per-pod concurrency is already limited
 	for _, pod := range pods {
 		wg.Add(1)
 		go func(p *client.PodInfo) {
@@ -143,7 +141,7 @@ func connectLocalMode(connMgr *client.ConnectionManager, baseURL, testID string,
 
 	var connections []*client.ParticipantConnection
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 50) // Concurrency limit
+	sem := make(chan struct{}, 50)
 
 	for _, participantID := range participantIDs {
 		wg.Add(1)
@@ -173,20 +171,30 @@ func runStatsLoop(connections []*client.ParticipantConnection, metricsMap map[ui
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	tickCount := 0
 	for {
 		select {
 		case <-ticker.C:
-			printStatsWithMetrics(connections, metricsMap, metricsMu)
+			tickCount++
+			printStatsWithMetrics(connections, metricsMap, metricsMu, tickCount)
 		case <-sigChan:
 			log.Println("\nShutting down...")
 			client.CloseConnections(connections)
-			printStatsWithMetrics(connections, metricsMap, metricsMu)
+			printFinalStats(connections, metricsMap, metricsMu)
 			return
 		}
 	}
 }
 
-func printStatsWithMetrics(connections []*client.ParticipantConnection, metricsMap map[uint32]*metrics.RTPMetrics, metricsMu *sync.Mutex) {
+type participantStat struct {
+	id     uint32
+	video  int64
+	audio  int64
+	bytes  int64
+	active bool
+}
+
+func printStatsWithMetrics(connections []*client.ParticipantConnection, metricsMap map[uint32]*metrics.RTPMetrics, metricsMu *sync.Mutex, tickCount int) {
 	if len(connections) == 0 {
 		log.Println("No connections to display")
 		return
@@ -195,6 +203,78 @@ func printStatsWithMetrics(connections []*client.ParticipantConnection, metricsM
 	var totalVideo, totalAudio int64
 	var totalVideoBytes, totalAudioBytes int64
 	connectedCount := 0
+	var topParticipants []participantStat
+
+	for _, conn := range connections {
+		video := conn.VideoPackets.Load()
+		audio := conn.AudioPackets.Load()
+		videoBytes := conn.VideoBytes.Load()
+		audioBytes := conn.AudioBytes.Load()
+		totalVideo += video
+		totalAudio += audio
+		totalVideoBytes += videoBytes
+		totalAudioBytes += audioBytes
+		connected := conn.Connected.Load()
+		if connected {
+			connectedCount++
+		}
+		topParticipants = append(topParticipants, participantStat{
+			id: conn.ID, video: video, audio: audio,
+			bytes: videoBytes + audioBytes, active: connected,
+		})
+	}
+
+	elapsed := time.Since(startTime)
+	totalPackets := totalVideo + totalAudio
+	totalBytes := totalVideoBytes + totalAudioBytes
+
+	log.Println()
+	log.Printf("Connections: %d/%d active (%.1f%%)", connectedCount, len(connections), float64(connectedCount)*100/float64(len(connections)))
+	log.Printf("Total Packets: %d (%.1f pkt/s)", totalPackets, float64(totalPackets)/elapsed.Seconds())
+	log.Printf("Total Bytes: %.2f MB (%.2f Mbps)", float64(totalBytes)/1024/1024, float64(totalBytes)*8/elapsed.Seconds()/1000000)
+	log.Println()
+	log.Println("Media Type Breakdown:")
+	if totalPackets > 0 {
+		log.Printf("  Video (H.264): %d packets (%.1f%%) - %.2f MB", totalVideo, float64(totalVideo)*100/float64(totalPackets), float64(totalVideoBytes)/1024/1024)
+		log.Printf("  Audio (Opus):  %d packets (%.1f%%) - %.2f MB", totalAudio, float64(totalAudio)*100/float64(totalPackets), float64(totalAudioBytes)/1024/1024)
+	} else {
+		log.Printf("  Video (H.264): %d packets", totalVideo)
+		log.Printf("  Audio (Opus):  %d packets", totalAudio)
+	}
+
+	// Sort by total packets and show top 5
+	for i := 0; i < len(topParticipants); i++ {
+		for j := i + 1; j < len(topParticipants); j++ {
+			if topParticipants[j].video+topParticipants[j].audio > topParticipants[i].video+topParticipants[i].audio {
+				topParticipants[i], topParticipants[j] = topParticipants[j], topParticipants[i]
+			}
+		}
+	}
+	log.Println()
+	log.Println("Top Participants:")
+	showCount := 5
+	if len(topParticipants) < showCount {
+		showCount = len(topParticipants)
+	}
+	for i := 0; i < showCount; i++ {
+		p := topParticipants[i]
+		status := "●"
+		if !p.active {
+			status = "○"
+		}
+		log.Printf("  %s Participant %d: %d video, %d audio (%.2f KB)", status, p.id, p.video, p.audio, float64(p.bytes)/1024)
+	}
+}
+
+func printFinalStats(connections []*client.ParticipantConnection, metricsMap map[uint32]*metrics.RTPMetrics, metricsMu *sync.Mutex) {
+	if len(connections) == 0 {
+		return
+	}
+
+	var totalVideo, totalAudio int64
+	var totalVideoBytes, totalAudioBytes int64
+	connectedCount := 0
+	activeParticipants := 0
 
 	for _, conn := range connections {
 		video := conn.VideoPackets.Load()
@@ -206,13 +286,33 @@ func printStatsWithMetrics(connections []*client.ParticipantConnection, metricsM
 		if conn.Connected.Load() {
 			connectedCount++
 		}
+		if video > 0 || audio > 0 {
+			activeParticipants++
+		}
 	}
 
-	log.Println("")
+	elapsed := time.Since(startTime)
+	totalPackets := totalVideo + totalAudio
+	totalBytes := totalVideoBytes + totalAudioBytes
+
+	log.Println()
+	log.Println("                 FINAL WEBRTC STATISTICS                   ")
+	log.Printf("Duration: %v", elapsed.Round(time.Second))
 	log.Printf("Total Participants: %d", len(connections))
-	log.Printf("  Connected: %d (%.1f%%)", connectedCount, float64(connectedCount)*100/float64(len(connections)))
-	log.Printf("Total Packets: %d", totalVideo+totalAudio)
-	log.Printf("  Video: %d packets (%.2f MB)", totalVideo, float64(totalVideoBytes)/1024/1024)
-	log.Printf("  Audio: %d packets (%.2f MB)", totalAudio, float64(totalAudioBytes)/1024/1024)
-	log.Println("")
+	log.Printf("  Connected at exit: %d (%.1f%%)", connectedCount, float64(connectedCount)*100/float64(len(connections)))
+	log.Printf("  Received packets: %d (%.1f%%)", activeParticipants, float64(activeParticipants)*100/float64(len(connections)))
+	log.Println()
+	log.Printf("Total Packets: %d (%.1f pkt/s avg)", totalPackets, float64(totalPackets)/elapsed.Seconds())
+	log.Printf("Total Bytes: %.2f MB (%.2f Mbps avg)", float64(totalBytes)/1024/1024, float64(totalBytes)*8/elapsed.Seconds()/1000000)
+	log.Println()
+	log.Println("Media Type Breakdown:")
+	if totalPackets > 0 {
+		log.Printf("  Video (H.264): %d packets (%.1f%%) - %.2f MB", totalVideo, float64(totalVideo)*100/float64(totalPackets), float64(totalVideoBytes)/1024/1024)
+		log.Printf("  Audio (Opus):  %d packets (%.1f%%) - %.2f MB", totalAudio, float64(totalAudio)*100/float64(totalPackets), float64(totalAudioBytes)/1024/1024)
+	} else {
+		log.Printf("  Video (H.264): %d packets - %.2f MB", totalVideo, float64(totalVideoBytes)/1024/1024)
+		log.Printf("  Audio (Opus):  %d packets - %.2f MB", totalAudio, float64(totalAudioBytes)/1024/1024)
+	}
+	log.Println("Note: Server test is still running. To stop it before reconnecting:")
+	log.Println("  curl -X POST http://localhost:8080/api/v1/test/<test_id>/stop")
 }
