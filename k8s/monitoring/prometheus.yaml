@@ -7,23 +7,21 @@ data:
     global:
       scrape_interval: 5s
       evaluation_interval: 5s
-
     scrape_configs:
       - job_name: 'orchestrator'
         static_configs:
           - targets:
-            - '10.244.0.38:8080'
-            - '10.244.0.39:8080'
-            - '10.244.0.37:8080'
-            - '10.244.0.44:8080'
-            - '10.244.0.40:8080'
-            - '10.244.0.41:8080'
-            - '10.244.0.42:8080'
-            - '10.244.0.46:8080'
-            - '10.244.0.43:8080'
-            - '10.244.0.45:8080'
+            - '10.244.0.6:8080'
+            - '10.244.0.7:8080'
+            - '10.244.0.8:8080'
+            - '10.244.0.10:8080'
+            - '10.244.0.9:8080'
+            - '10.244.0.11:8080'
+            - '10.244.0.13:8080'
+            - '10.244.0.14:8080'
+            - '10.244.0.15:8080'
+            - '10.244.0.12:8080'
         metrics_path: /metrics
-
       - job_name: 'prometheus'
         static_configs:
           - targets: ['localhost:9090']
@@ -46,21 +44,21 @@ spec:
     spec:
       serviceAccountName: prometheus
       containers:
-        - name: prometheus
-          image: prom/prometheus:latest
-          ports:
-            - containerPort: 9090
-          volumeMounts:
-            - name: config
-              mountPath: /etc/prometheus
-          args:
-            - "--config.file=/etc/prometheus/prometheus.yml"
-            - "--storage.tsdb.path=/prometheus"
-            - "--web.enable-lifecycle"
-      volumes:
+      - name: prometheus
+        image: prom/prometheus:latest
+        ports:
+        - containerPort: 9090
+        volumeMounts:
         - name: config
-          configMap:
-            name: prometheus-config
+          mountPath: /etc/prometheus
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--web.enable-lifecycle'
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
 ---
 apiVersion: v1
 kind: Service
@@ -69,8 +67,8 @@ metadata:
 spec:
   type: NodePort
   ports:
-    - port: 9090
-      targetPort: 9090
-      nodePort: 30090
+  - port: 9090
+    targetPort: 9090
+    nodePort: 30090
   selector:
     app: prometheus
