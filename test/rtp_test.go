@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/rtp"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/rtp"
 )
 
 func TestPacketizeSingleNALU(t *testing.T) {

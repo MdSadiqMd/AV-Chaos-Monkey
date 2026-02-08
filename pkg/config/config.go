@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/media"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/constants"
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/media"
 )
 
 type Config struct {

@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/spike"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/config"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/k8s"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/logging"
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/spike"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/utils"
 )
 
@@ -207,5 +207,5 @@ func displayMetrics(client *utils.HTTPClient, cfg *config.Config, podCache *k8s.
 	fmt.Printf(" | Remaining: %ds | Spikes: %d/%d", remaining, spikeCount, cfg.Spikes.Count)
 	fmt.Println()
 	logging.LogMetrics("Frames=%d | Packets=%d | Bitrate=%.0fkbps", totalFrames, totalPackets, utils.GetFloat64(aggregate, "total_bitrate_kbps"))
-	logging.LogMetrics("Jitter=%.2fms | Loss=%.2f%% | MOS=%.2f", avgJitter, avgLoss*100, utils.GetFloat64(aggregate, "avg_mos_score"))
+	logging.LogMetrics("Jitter=%.2fms | Loss=%.2f%% | MOS=%.2f", avgJitter, avgLoss, utils.GetFloat64(aggregate, "avg_mos_score"))
 }

@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/network"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/network"
 )
 
 func TestNewDegrader(t *testing.T) {
