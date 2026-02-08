@@ -25,7 +25,8 @@ RUN apk add --no-cache \
     ca-certificates \
     dumb-init \
     curl \
-    ffmpeg
+    ffmpeg \
+    iproute2
 
 # Create non-root user
 RUN adduser -D -u 1000 app
