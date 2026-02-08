@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/client"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/client"
 	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 )
 

@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/server"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/server"
 )
 
 func main() {
