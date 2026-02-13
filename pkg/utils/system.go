@@ -94,24 +94,21 @@ func DetectCPUCores() int {
 }
 
 func CalculateOptimalReplicas(dockerMemGB int) int {
-	// Memory per pod: 2GB (matches StatefulSet resource limits)
-	// Reserve 2GB for Prometheus + Grafana + system
-	availableMem := dockerMemGB - 2
-
-	if availableMem >= 20 {
-		return 10 // 20GB+ → 10 pods
-	} else if availableMem >= 16 {
-		return 8 // 16GB+ → 8 pods
-	} else if availableMem >= 12 {
-		return 6 // 12GB+ → 6 pods
-	} else if availableMem >= 8 {
-		return 4 // 8GB+ → 4 pods
-	} else if availableMem >= 6 {
-		return 3 // 6GB+ → 3 pods
-	} else if availableMem >= 4 {
-		return 2 // 4GB+ → 2 pods
+	// Calculate based on available memory after reserving for monitoring
+	// Monitoring (Prometheus + Grafana + Coturn) needs ~1-2GB depending on config
+	// Each orchestrator pod needs 256Mi-2Gi depending on Docker memory
+	if dockerMemGB >= 16 {
+		return 10 // High memory: 10 pods with 2GB each
+	} else if dockerMemGB >= 12 {
+		return 8 // 12GB+: 8 pods
+	} else if dockerMemGB >= 8 {
+		return 6 // 8GB+: 6 pods with 1GB each
+	} else if dockerMemGB >= 6 {
+		return 4 // 6GB+: 4 pods
+	} else if dockerMemGB >= 4 {
+		return 2 // 4GB+: 2 pods with 512Mi each
 	}
-	return 1 // <4GB → 1 pod
+	return 1 // <4GB: 1 pod with minimal resources
 }
 
 func CalculateParticipantsPerPod() int {
