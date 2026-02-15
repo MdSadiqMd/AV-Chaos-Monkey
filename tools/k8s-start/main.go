@@ -131,9 +131,12 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 		logging.LogConfig("Using user-specified participants: %d", participants)
 	}
 
-	printConfiguration(replicas, participants, mediaConfig)
+	printConfiguration(replicas, participants, mediaConfig, dockerMem)
 
 	if err := k8s.BuildImage(projectRoot, ""); err != nil {
+		return err
+	}
+	if err := k8s.UpdateResourceLimits(projectRoot, dockerMem); err != nil {
 		return err
 	}
 	if err := k8s.UpdateReplicas(projectRoot, replicas); err != nil {
@@ -180,13 +183,16 @@ func runK8sDeployment(projectRoot string, userReplicas, userParticipants int, sk
 	return nil
 }
 
-func printConfiguration(replicas, participants int, mediaConfig MediaConfig) {
+func printConfiguration(replicas, participants int, mediaConfig MediaConfig, dockerMem int) {
+	resourceConfig := k8s.CalculateResourceConfig(dockerMem)
+	
 	fmt.Println()
 	fmt.Printf("%sFinal Configuration:%s\n", utils.BOLD, utils.NC)
 	fmt.Printf("  Replicas:          %s%d pods%s\n", utils.CYAN, replicas, utils.NC)
-	fmt.Printf("  Participants:      %s%d%s (~%d per pod)\n", utils.CYAN, participants, utils.NC, participants/replicas)
-	fmt.Printf("  Memory per pod:    %s2GB%s\n", utils.CYAN, utils.NC)
-	fmt.Printf("  Total memory:      %s%dGB%s (pods + monitoring)\n", utils.CYAN, replicas*2+2, utils.NC)
+	fmt.Printf("  Participants:      %s%d%s (~%d per pod)\n", utils.CYAN, participants, utils.NC, participants/max(replicas, 1))
+	fmt.Printf("  Pod memory:        %s%s (request) / %s (limit)%s\n", utils.CYAN, 
+		resourceConfig.OrchestratorMemRequest, resourceConfig.OrchestratorMemLimit, utils.NC)
+	fmt.Printf("  Coturn replicas:   %s%d%s\n", utils.CYAN, resourceConfig.CoturnReplicas, utils.NC)
 	fmt.Printf("  Throughput:        %s%dx%s\n", utils.CYAN, replicas, utils.NC)
 
 	if mediaConfig.MediaPath != "" {
