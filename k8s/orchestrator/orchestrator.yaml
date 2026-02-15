@@ -28,49 +28,22 @@ spec:
       initContainers:
         - name: detect-host-ip
           image: busybox:latest
-          command:
-            - /bin/sh
-            - -c
+          command: ["/bin/sh", "-c"]
+          args:
             - |
-              # Try to detect host IP using methods
-              # macOS: ipconfig getifaddr en0
-              # Linux: hostname -I | awk '{print $1}' or ifconfig
-
-              # Method 1: Try to get from node IP (Kubernetes)
               if [ -n "$NODE_IP" ] && [ "$NODE_IP" != "127.0.0.1" ]; then
                 echo "$NODE_IP" > /shared/host-ip
                 echo "Detected host IP from NODE_IP: $NODE_IP"
                 exit 0
               fi
-
-              # Method 2: Try Linux method (hostname -I)
               if command -v hostname >/dev/null 2>&1; then
                 HOST_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "")
                 if [ -n "$HOST_IP" ] && [ "$HOST_IP" != "127.0.0.1" ]; then
                   echo "$HOST_IP" > /shared/host-ip
-                  echo "Detected host IP from hostname -I: $HOST_IP"
                   exit 0
                 fi
               fi
-
-              # Method 3: Try ifconfig (Linux/macOS)
-              if command -v ifconfig >/dev/null 2>&1; then
-                HOST_IP=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | sed 's/addr://' 2>/dev/null || echo "")
-                if [ -n "$HOST_IP" ]; then
-                  echo "$HOST_IP" > /shared/host-ip
-                  echo "Detected host IP from ifconfig: $HOST_IP"
-                  exit 0
-                fi
-              fi
-
-              # Fallback: Use node IP or default to 127.0.0.1
-              if [ -n "$NODE_IP" ]; then
-                echo "$NODE_IP" > /shared/host-ip
-                echo "Using NODE_IP as fallback: $NODE_IP"
-              else
-                echo "127.0.0.1" > /shared/host-ip
-                echo "Using default 127.0.0.1 (no IP detection method worked)"
-              fi
+              echo "${NODE_IP:-127.0.0.1}" > /shared/host-ip
           env:
             - name: NODE_IP
               valueFrom:
@@ -117,7 +90,7 @@ spec:
               memory: "2Gi"
             limits:
               cpu: "4"
-              memory: "2Gi"
+              memory: "4Gi"
           livenessProbe:
             httpGet:
               path: /healthz
@@ -130,37 +103,31 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 5
-          command:
-            - /bin/sh
-            - -c
+          command: ["/bin/sh", "-c"]
+          args:
             - |
               set -e
-              # Check if UDP_TARGET_HOST is explicitly set to a real IP (not empty or 127.0.0.1)
-              # If so, use it directly without auto-detection
-              if [ -n "$UDP_TARGET_HOST" ] && [ "$UDP_TARGET_HOST" != "127.0.0.1" ] && [ "$UDP_TARGET_HOST" != "" ]; then
-                echo "Using explicit UDP_TARGET_HOST from env: $UDP_TARGET_HOST" >&2
+              
+              # Set UDP target host
+              if [ -n "$UDP_TARGET_HOST" ] && [ "$UDP_TARGET_HOST" != "127.0.0.1" ]; then
+                echo "Using UDP_TARGET_HOST: $UDP_TARGET_HOST" >&2
               elif [ -f /shared/host-ip ]; then
-                # Read host IP from init container
                 export UDP_TARGET_HOST=$(cat /shared/host-ip)
-                echo "Using detected UDP_TARGET_HOST from init: $UDP_TARGET_HOST" >&2
+                echo "Using detected UDP_TARGET_HOST: $UDP_TARGET_HOST" >&2
               else
-                # Fallback: try to detect at runtime
-                if command -v hostname >/dev/null 2>&1; then
-                  export UDP_TARGET_HOST=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "127.0.0.1")
-                elif command -v ifconfig >/dev/null 2>&1; then
-                  export UDP_TARGET_HOST=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | sed 's/addr://' 2>/dev/null || echo "127.0.0.1")
-                else
-                  export UDP_TARGET_HOST="${NODE_IP:-127.0.0.1}"
-                fi
-                echo "Detected UDP_TARGET_HOST at runtime: $UDP_TARGET_HOST" >&2
+                export UDP_TARGET_HOST="${NODE_IP:-127.0.0.1}"
+                echo "Using fallback UDP_TARGET_HOST: $UDP_TARGET_HOST" >&2
               fi
-
-              PARTITION_ID=$(echo "$POD_NAME" | sed 's/.*-//')
-              if [ -z "$PARTITION_ID" ] || ! echo "$PARTITION_ID" | grep -qE '^[0-9]+$'; then
+              
+              # Extract partition ID from pod name (e.g., orchestrator-0 -> 0)
+              PARTITION_ID=$(echo "$POD_NAME" | grep -oE '[0-9]+$' || echo "0")
+              if [ -z "$PARTITION_ID" ]; then
                 PARTITION_ID=0
               fi
+              
               echo "Starting orchestrator partition $PARTITION_ID of $TOTAL_PARTITIONS" >&2
-              exec env PARTITION_ID="$PARTITION_ID" UDP_TARGET_HOST="$UDP_TARGET_HOST" /usr/bin/dumb-init -- /usr/local/bin/orchestrator -http :8080
+              export PARTITION_ID
+              exec /usr/bin/dumb-init -- /usr/local/bin/orchestrator -http :8080
           volumeMounts:
             - name: host-ip
               mountPath: /shared
