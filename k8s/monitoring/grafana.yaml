@@ -54,6 +54,13 @@ spec:
         image: grafana/grafana:latest
         ports:
         - containerPort: 3000
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
         env:
         - name: GF_SECURITY_ADMIN_PASSWORD
           value: "admin"
