@@ -57,6 +57,13 @@ Distributed chaos engineering platform for load testing video conferencing syste
    - **WebRTC Receiver**: Establishes 1:1 WebRTC connections via SDP exchange through TURN servers
    - Both forward to your video call system under test (SFU/MCU/Mesh)
 
+8. **Observability Stack** (Optional):
+   - **Prometheus**: Scrapes `/metrics` endpoint from all orchestrator pods every 5s
+   - **Grafana**: Visualizes metrics via pre-configured dashboard (admin/admin)
+   - Metrics exposed: participant count, packets sent, bytes sent, active spikes, packet loss %, jitter, MOS score
+   - Access: Prometheus on :30090, Grafana on :30030 (NodePort)
+   - Orchestrator pods annotated for auto-discovery: `prometheus.io/scrape: "true"`
+
 ## Core Concepts
 
 ### Participant Simulation
@@ -499,13 +506,29 @@ av_chaos_monkey_jitter_ms
 
 ### Grafana Dashboard
 ```bash
-# Start monitoring stack
+# Docker Mode: Start monitoring stack
 docker-compose --profile monitoring up
 
+# Kubernetes Mode: Deploy monitoring
+kubectl apply -f k8s/monitoring/prometheus-rbac.yaml
+kubectl apply -f k8s/monitoring/prometheus.yaml
+kubectl apply -f k8s/monitoring/grafana.yaml
+
 # Access Grafana
-open http://localhost:3000
-# Default: admin/admin
+# Docker: http://localhost:3000
+# Kubernetes: http://localhost:30030 (NodePort)
+# Default credentials: admin/admin
+
+# Access Prometheus
+# Docker: http://localhost:9091
+# Kubernetes: http://localhost:30090 (NodePort)
 ```
+
+**Kubernetes Auto-Discovery:**
+- Orchestrator pods annotated with `prometheus.io/scrape: "true"`
+- Prometheus scrapes `/metrics` from all pods every 5s
+- Grafana pre-configured with Prometheus datasource
+- Dashboard auto-provisioned on startup
 
 ### Real-time Stats
 ```bash
