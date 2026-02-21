@@ -2,9 +2,7 @@
 Distributed chaos engineering platform for load testing video conferencing systems. Simulates 1500+ WebRTC participants with H.264/Opus streams and injects network chaos spikes to validate system resilience under degraded conditions
 
 ## Architecture
-<img width="1484" height="1566" alt="image" src="https://github.com/user-attachments/assets/e3e50047-fbab-4930-9171-d13a5036e27e" />
-
-**Architecture Components:**
+<img width="1850" height="1776" alt="image" src="https://github.com/user-attachments/assets/7486488c-9092-4de2-a02a-f699c8d34c93" />
 
 1. **Media Processing Pipeline**:
    - FFmpeg converts input video to H.264 Annex-B and Ogg/Opus at startup
