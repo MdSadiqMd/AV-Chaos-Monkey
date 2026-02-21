@@ -4,71 +4,58 @@ Distributed chaos engineering platform for load testing video conferencing syste
 ## Architecture
 <img width="1566" height="1500" alt="image" src="https://github.com/user-attachments/assets/d470648f-ccbc-431c-95be-2541de3be07f" />
 
-**Architecture Details:**
+**Architecture Components:**
 
-1. **Orchestrator StatefulSet** (Kubernetes):
-   - 10 replicas (orchestrator-0 to orchestrator-9)
-   - Each pod extracts partition ID from pod name: `orchestrator-3` → `PARTITION_ID=3`
-   - Participant assignment: `participant_id % TOTAL_PARTITIONS = PARTITION_ID`
-   - Resources: 1-4 CPU, 2-4Gi memory per pod
-   - Environment: `UDP_TARGET_HOST=udp-relay`, `TOTAL_PARTITIONS=10`
-
-2. **UDP Relay Architecture**:
-   - Single pod running Python script (hostNetwork: true)
-   - Listens UDP on :5000 (receives from all orchestrator pods)
-   - Streams to TCP :5001 with 2-byte length-prefixed framing
-   - kubectl port-forward creates TCP tunnel (15001:5001)
-   - Local relay (tools/udp-relay) converts TCP back to UDP :5002
-
-3. **TURN Server Setup** (WebRTC NAT Traversal):
-   - StatefulSet with 3 initial replicas (coturn-0, coturn-1, coturn-2)
-   - HPA scales 1-10 replicas based on CPU (70%) and memory (80%)
-   - Each replica: 500m-2 CPU, 512Mi-1Gi memory
-   - Ports: 3478 (TURN), 49152-65535 (relay range)
-   - Services: `coturn` (headless), `coturn-lb` (load-balanced)
-   - Credentials: webrtc/webrtc123
-
-4. **WebRTC Connector** (Optional Proxy Layer):
-   - Deployment with 3 initial replicas
-   - HPA scales 2-10 replicas based on CPU (60%) and memory (70%)
-   - Proxies WebRTC connections to orchestrator pods
-   - Environment: `ORCHESTRATOR_SERVICE=orchestrator-headless`
-   - Max 100 concurrent connections per pod
-
-5. **Port Allocation Formula**:
-   ```
-   port = base_port + (partition_id × 10000) + participant_index
-   
-   Examples:
-   - Partition 0: 5000-14999
-   - Partition 1: 15000-24999
-   - Partition 9: 95000-104999
-   ```
-
-6. **Partitioning Logic**:
-   ```
-   participant_id % total_partitions = partition_id
-   
-   Examples (10 partitions):
-   - ID 1000 → 1000 % 10 = 0 → orchestrator-0
-   - ID 1001 → 1001 % 10 = 1 → orchestrator-1
-   - ID 1009 → 1009 % 10 = 9 → orchestrator-9
-   - ID 1010 → 1010 % 10 = 0 → orchestrator-0
-   ```
-
-7. **Media Caching Strategy**:
-   - FFmpeg converts MP4 once at startup
-   - H.264 NAL units (SPS/PPS/IDR/Slices) cached in memory
-   - Opus frames extracted from Ogg container
-   - All participants share read-only buffers (zero-copy)
+1. **Media Processing Pipeline**:
+   - FFmpeg converts input video to H.264 Annex-B and Ogg/Opus at startup
+   - NAL Reader parses H.264 stream (SPS/PPS/IDR/Slices)
+   - Opus Reader extracts 20ms audio frames from Ogg container
+   - Frames cached in memory, shared across all participants (zero-copy)
    - Reduces CPU by ~90% vs per-participant encoding
 
-8. **Chaos Injection Scope**:
-   - Applied at RTP layer (post-packetization, pre-transport)
-   - chaos-test CLI broadcasts to all pods via kubectl exec
-   - Each pod maintains per-participant spike state
-   - Spike types: packet_loss, jitter, bitrate_reduce, frame_drop
-   - Distribution strategies: even, random, front_loaded, back_loaded, legacy
+2. **Control Plane**:
+   - HTTP Server (:8080) manages test lifecycle via REST API
+   - Spike Scheduler distributes chaos events (even/random/front/back/legacy)
+   - Network Degrader applies chaos: packet loss (1-25%), jitter (10-50ms), bitrate reduction (30-80%), frame drops (10-60%)
+   - Loaded chaos configuration applied to participant pool
+
+3. **Participant Pool**:
+   - Auto-partitioned across pods using: `participant_id % total_partitions = partition_id`
+   - Each participant generates RTP streams (PT=96 video, PT=111 audio)
+   - Participant ID embedded in RTP extension header (ID=1)
+   - Pool size: 1-100 (local), 100-500 (Docker), 500-1500 (Kubernetes)
+
+4. **Kubernetes Auto-Configuration**:
+   - Pods auto-detect partition ID from pod name: `orchestrator-3` → `PARTITION_ID=3`
+   - Port allocation: `base_port + (partition_id × 10000) + participant_index`
+   - Example: Partition 0 uses 5000-14999, Partition 1 uses 15000-24999
+   - StatefulSet with 10 replicas, each handling ~150 participants
+   - Resources: 1-4 CPU, 2-4Gi memory per pod
+   - Auto-configures based on host machine specs
+
+5. **UDP Relay Chain** (Kubernetes only):
+   ```
+   Orchestrator Pods (10×) → UDP :5000 → udp-relay Pod (Python)
+   → Length-Prefixed TCP :5001 → kubectl port-forward 15001:5001
+   → tools/udp-relay (Go) → UDP :5002 → Your Receiver
+   ```
+   - **Why**: kubectl port-forward only supports TCP, not UDP
+   - **In-cluster relay**: Python script aggregates UDP from all pods, streams as TCP with 2-byte length prefix
+   - **Local relay**: Go tool converts TCP stream back to UDP packets
+   - Aggregates 1500 participant streams into single connection
+
+6. **WebRTC Infrastructure**:
+   - **Coturn StatefulSet**: 3 initial replicas, HPA scales 1-10 based on load (~500 participants/replica)
+   - **coturn-lb Service**: Load balances TURN traffic across replicas
+   - **webrtc-connector**: Optional proxy layer (Deployment + HPA 2-10 replicas), handles SDP signaling
+   - **Docker Mode**: Single Coturn container for local testing
+   - Ports: 3478 (TURN), 49152-65535 (relay range)
+   - Credentials: webrtc/webrtc123
+
+7. **Client Integration**:
+   - **UDP Receiver**: Receives aggregated RTP stream from all participants via relay chain
+   - **WebRTC Receiver**: Establishes 1:1 WebRTC connections via SDP exchange through TURN servers
+   - Both forward to your video call system under test (SFU/MCU/Mesh)
 
 ## Core Concepts
 
