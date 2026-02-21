@@ -2,6 +2,7 @@
 Distributed chaos engineering platform for load testing video conferencing systems. Simulates 1500+ WebRTC participants with H.264/Opus streams and injects network chaos spikes to validate system resilience under degraded conditions
 
 ## Architecture
+<img width="1566" height="1500" alt="image" src="https://github.com/user-attachments/assets/d470648f-ccbc-431c-95be-2541de3be07f" />
 
 **Architecture Details:**
 
