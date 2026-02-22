@@ -8,7 +8,7 @@
     "interval_seconds": 5,
     "types": {
       "rtp_packet_loss": {
-        "weight": 40,
+        "weight": 20,
         "params": {
           "loss_percentage_min": 1,
           "loss_percentage_max": 25,
@@ -16,23 +16,23 @@
         }
       },
       "network_jitter": {
-        "weight": 20,
+        "weight": 50,
         "params": {
-          "base_latency_ms_min": 10,
-          "base_latency_ms_max": 50,
-          "jitter_std_dev_ms_min": 20,
-          "jitter_std_dev_ms_max": 200
+          "base_latency_ms_min": 50,
+          "base_latency_ms_max": 150,
+          "jitter_std_dev_ms_min": 100,
+          "jitter_std_dev_ms_max": 300
         }
       },
       "frame_drop": {
-        "weight": 20,
+        "weight": 15,
         "params": {
           "drop_percentage_min": 10,
           "drop_percentage_max": 60
         }
       },
       "bitrate_reduce": {
-        "weight": 20,
+        "weight": 15,
         "params": {
           "reduction_percent_min": 30,
           "reduction_percent_max": 80,
@@ -41,8 +41,8 @@
         }
       }
     },
-    "duration_seconds_min": 2,
-    "duration_seconds_max": 8,
+    "duration_seconds_min": 5,
+    "duration_seconds_max": 15,
     "participant_selection": {
       "single_weight": 40,
       "multiple_weight": 35,
@@ -52,7 +52,7 @@
     }
   },
   "spike_distribution": {
-    "strategy": "random",
+    "strategy": "legacy",
     "min_spacing_seconds": 5,
     "jitter_percent": 15
   },
