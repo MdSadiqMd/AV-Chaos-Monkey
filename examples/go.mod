@@ -1,4 +1,4 @@
-module github.com/MdSadiqMd/AV-Chaos-Monkey/examples/go
+module github.com/MdSadiqMd/AV-Chaos-Monkey/examples
 
 go 1.21
 

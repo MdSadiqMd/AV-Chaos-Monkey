@@ -1,64 +1,19 @@
 package main
 
 import (
-	"encoding/binary"
-	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/internal/rtp"
+	"github.com/MdSadiqMd/AV-Chaos-Monkey/pkg/metrics"
 )
 
 func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-}
-
-type RTPHeader struct {
-	Version       uint8
-	PayloadType   uint8
-	Sequence      uint16
-	Timestamp     uint32
-	SSRC          uint32
-	Marker        bool
-	ParticipantID uint32
-	Payload       []byte
-}
-
-func parseRTPPacket(data []byte) (*RTPHeader, error) {
-	if len(data) < 12 {
-		return nil, fmt.Errorf("packet too short")
-	}
-	header := &RTPHeader{}
-	header.Version = (data[0] >> 6) & 0x03
-	padding := (data[0] >> 5) & 0x01
-	extension := (data[0] >> 4) & 0x01
-	csrcCount := data[0] & 0x0F
-	header.Marker = ((data[1] >> 7) & 0x01) != 0
-	header.PayloadType = data[1] & 0x7F
-	header.Sequence = binary.BigEndian.Uint16(data[2:4])
-	header.Timestamp = binary.BigEndian.Uint32(data[4:8])
-	header.SSRC = binary.BigEndian.Uint32(data[8:12])
-	offset := 12 + int(csrcCount)*4
-	if extension != 0 {
-		if len(data) < offset+4 {
-			return nil, fmt.Errorf("extension header incomplete")
-		}
-		extID := binary.BigEndian.Uint16(data[offset : offset+2])
-		extLen := binary.BigEndian.Uint16(data[offset+2:offset+4]) * 4
-		if extID == 1 && extLen == 4 && len(data) >= offset+8 {
-			header.ParticipantID = binary.LittleEndian.Uint32(data[offset+4 : offset+8])
-		}
-		offset += 4 + int(extLen)
-	}
-	if padding != 0 && len(data) > 0 {
-		paddingLen := int(data[len(data)-1])
-		header.Payload = data[offset : len(data)-paddingLen]
-	} else {
-		header.Payload = data[offset:]
-	}
-	return header, nil
 }
 
 type PacketStats struct {
@@ -68,6 +23,7 @@ type PacketStats struct {
 	UniqueSSRCs                              map[uint32]bool
 	ParticipantPackets                       map[uint32]int
 	StartTime                                time.Time
+	Metrics                                  *metrics.RTPMetrics
 }
 
 func main() {
@@ -88,6 +44,7 @@ func main() {
 	stats := &PacketStats{
 		NALTypes: make(map[byte]int), UniqueSSRCs: make(map[uint32]bool),
 		ParticipantPackets: make(map[uint32]int), StartTime: time.Now(),
+		Metrics: metrics.NewRTPMetrics(0), // Use shared metrics
 	}
 	packetCount := 0
 	buffer := make([]byte, 4096)
@@ -95,6 +52,20 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigChan; printStats(stats, packetCount); os.Exit(0) }()
+
+	// Periodic jitter reporting
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	go func() {
+		for range ticker.C {
+			jitter := stats.Metrics.GetJitter()
+			if jitter > 0 {
+				log.Printf("[Jitter] Current: %.2fms | P99: %.2fms",
+					jitter,
+					stats.Metrics.GetJitterP99())
+			}
+		}
+	}()
 
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buffer)
@@ -105,7 +76,7 @@ func main() {
 		packetCount++
 		stats.TotalBytes += int64(n)
 
-		header, err := parseRTPPacket(buffer[:n])
+		header, err := rtp.ParsePacket(buffer[:n])
 		if err != nil {
 			continue
 		}
@@ -113,6 +84,11 @@ func main() {
 		stats.UniqueSSRCs[header.SSRC] = true
 		if header.ParticipantID > 0 {
 			stats.ParticipantPackets[header.ParticipantID]++
+		}
+
+		// Record packet for jitter calculation (video packets)
+		if header.PayloadType == 96 {
+			stats.Metrics.RecordPacketReceived(header.Timestamp, header.Sequence, len(buffer[:n]))
 		}
 
 		switch header.PayloadType {
@@ -157,6 +133,11 @@ func printStats(stats *PacketStats, totalPackets int) {
 	if stats.OtherPackets > 0 {
 		log.Printf("  Other: %d packets", stats.OtherPackets)
 	}
+	log.Println()
+	log.Println("Jitter Metrics (Video):")
+	log.Printf("  Current: %.2f ms", stats.Metrics.GetJitter())
+	log.Printf("  P99: %.2f ms", stats.Metrics.GetJitterP99())
+	log.Printf("  Packet Loss: %.2f%%", stats.Metrics.GetPacketLossFromSequence())
 	log.Println()
 	log.Printf("Unique Streams (SSRCs): %d", len(stats.UniqueSSRCs))
 	log.Printf("Unique Participants: %d", len(stats.ParticipantPackets))
