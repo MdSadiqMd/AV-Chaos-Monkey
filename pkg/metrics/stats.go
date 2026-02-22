@@ -133,6 +133,18 @@ func (m *RTPMetrics) RecordNACK()          { m.nackCount.Add(1) }
 func (m *RTPMetrics) RecordPLI()           { m.pliCount.Add(1) }
 func (m *RTPMetrics) RecordFIR()           { m.firCount.Add(1) }
 
+func (m *RTPMetrics) RecordSimulatedJitter(jitterMs float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Simulate jitter calculation using RFC 3550 formula
+	// J(i) = J(i-1) + (|D(i-1,i)| - J(i-1))/16
+	m.jitter = m.jitter + (jitterMs-m.jitter)/16.0
+	m.jitterSamples = append(m.jitterSamples, m.jitter)
+	if len(m.jitterSamples) > 1000 {
+		m.jitterSamples = m.jitterSamples[len(m.jitterSamples)-500:]
+	}
+}
+
 func (m *RTPMetrics) GetJitter() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
