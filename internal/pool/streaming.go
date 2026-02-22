@@ -2,6 +2,7 @@ package pool
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 
@@ -40,6 +41,7 @@ func (p *VirtualParticipant) runFrameLoop() {
 				p.metrics.RecordPacketLost()
 				continue
 			}
+			p.applyJitterDelay()
 			if _, err := p.udpConn.WriteToUDP(data, p.targetAddr); err != nil {
 				p.metrics.RecordPacketLost()
 				logging.LogError("Participant %d: UDP send error: %v", p.ID, err)
@@ -123,6 +125,7 @@ func (p *VirtualParticipant) runVideoLoop() {
 				p.metrics.RecordPacketLost()
 				continue
 			}
+			p.applyJitterDelay()
 			if _, err := p.udpConn.WriteToUDP(data, p.targetAddr); err != nil {
 				p.metrics.RecordPacketLost()
 			}
@@ -162,6 +165,7 @@ func (p *VirtualParticipant) runAudioLoop() {
 			p.metrics.RecordPacketLost()
 			continue
 		}
+		p.applyJitterDelay()
 		if _, err := p.udpConn.WriteToUDP(data, p.targetAddr); err != nil {
 			p.metrics.RecordPacketLost()
 		}
@@ -196,4 +200,35 @@ func (p *VirtualParticipant) shouldDropPacket() bool {
 		}
 	}
 	return false
+}
+
+func (p *VirtualParticipant) applyJitterDelay() {
+	p.activeSpikesMu.RLock()
+	defer p.activeSpikesMu.RUnlock()
+	for _, spike := range p.activeSpikes {
+		if spike.Type == "network_jitter" {
+			baseLatencyStr, hasBase := spike.Params["base_latency_ms"]
+			jitterStr, hasJitter := spike.Params["jitter_std_dev_ms"]
+
+			if hasBase && hasJitter {
+				var baseLatency, jitterStdDev int
+				fmt.Sscanf(baseLatencyStr, "%d", &baseLatency)
+				fmt.Sscanf(jitterStr, "%d", &jitterStdDev)
+
+				// Apply base latency + random jitter (normal distribution approximation)
+				// Using Box-Muller transform for normal distribution
+				u1 := rand.Float64()
+				u2 := rand.Float64()
+				z := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
+
+				jitterMs := min(max(baseLatency+int(z*float64(jitterStdDev)), 0), 2000)
+				if jitterMs > 0 {
+					// Record the applied jitter as simulated inter-arrival variance
+					p.metrics.RecordSimulatedJitter(float64(jitterMs))
+					time.Sleep(time.Duration(jitterMs) * time.Millisecond)
+				}
+				return
+			}
+		}
+	}
 }
